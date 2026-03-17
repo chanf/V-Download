@@ -18,14 +18,20 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
+data class DownloadQueueItem(
+    val rawText: String,
+    val normalizedUrl: String
+)
+
 data class CookieImportUiState(
     val urlDraft: String = "",
-    val queuedUrls: List<String> = emptyList(),
+    val queuedUrls: List<DownloadQueueItem> = emptyList(),
     val isImporting: Boolean = false,
     val isDownloading: Boolean = false,
     val downloadProgress: Int = 0,
     val downloadingUrl: String? = null,
     val downloadMessage: String? = null,
+    val downloadDiagnostics: String? = null,
     val totalCookies: Int = 0,
     val lastImportResult: CookieImportResult? = null,
     val storedVideoSourceReports: List<VideoCookieSourceReport> = emptyList(),
@@ -48,44 +54,80 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun onSharedUrlReceived(sharedUrl: String?) {
-        val normalized = normalizeUrl(sharedUrl ?: return) ?: return
+        val rawShared = sharedUrl?.trim().orEmpty()
+        if (rawShared.isBlank()) return
+        val normalized = normalizeUrl(rawShared) ?: return
+        val displayText = rawShared.takeIf { it.length <= 240 } ?: normalized
         if (uiState.urlDraft.isBlank()) {
-            uiState = uiState.copy(urlDraft = normalized)
+            uiState = uiState.copy(urlDraft = displayText)
         }
     }
 
     fun updateUrlDraft(value: String) {
-        uiState = uiState.copy(urlDraft = value, errorMessage = null)
+        uiState = uiState.copy(urlDraft = value, errorMessage = null, downloadDiagnostics = null)
     }
 
     fun addDraftUrlToQueue() {
-        val normalized = normalizeUrl(uiState.urlDraft)
+        val rawInput = uiState.urlDraft.trim()
+        val normalized = normalizeUrl(rawInput)
         if (normalized == null) {
-            uiState = uiState.copy(errorMessage = "请输入有效 URL")
-            return
-        }
-
-        if (uiState.queuedUrls.contains(normalized)) {
             uiState = uiState.copy(
-                urlDraft = "",
-                errorMessage = "该 URL 已在待下载列表中"
+                errorMessage = "请输入有效 URL",
+                downloadDiagnostics = buildDownloadDiagnostics(
+                    phase = "输入校验失败",
+                    providedText = rawInput,
+                    normalizedUrl = null,
+                    hasStorageWritePermission = true,
+                    error = IllegalArgumentException("未检测到可用的 URL")
+                )
             )
             return
         }
 
+        if (uiState.queuedUrls.any { it.normalizedUrl == normalized }) {
+            uiState = uiState.copy(
+                urlDraft = "",
+                errorMessage = "该 URL 已在待下载列表中",
+                downloadDiagnostics = buildDownloadDiagnostics(
+                    phase = "加入队列失败",
+                    providedText = rawInput,
+                    normalizedUrl = normalized,
+                    hasStorageWritePermission = true,
+                    error = IllegalStateException("URL 去重命中")
+                )
+            )
+            return
+        }
+
+        val queueItem = DownloadQueueItem(
+            rawText = rawInput.ifBlank { normalized },
+            normalizedUrl = normalized
+        )
         uiState = uiState.copy(
             urlDraft = "",
-            queuedUrls = listOf(normalized) + uiState.queuedUrls,
-            errorMessage = null
+            queuedUrls = listOf(queueItem) + uiState.queuedUrls,
+            errorMessage = null,
+            downloadDiagnostics = null
         )
     }
 
     fun startDownload(hasStorageWritePermission: Boolean) {
         if (uiState.isDownloading) return
 
-        val candidate = uiState.queuedUrls.firstOrNull() ?: normalizeUrl(uiState.urlDraft)
+        val queuedItem = uiState.queuedUrls.firstOrNull()
+        val providedText = queuedItem?.rawText ?: uiState.urlDraft.trim()
+        val candidate = queuedItem?.normalizedUrl ?: normalizeUrl(providedText)
         if (candidate == null) {
-            uiState = uiState.copy(errorMessage = "请先输入可下载的 URL")
+            uiState = uiState.copy(
+                errorMessage = "请先输入可下载的 URL",
+                downloadDiagnostics = buildDownloadDiagnostics(
+                    phase = "下载前校验失败",
+                    providedText = providedText,
+                    normalizedUrl = null,
+                    hasStorageWritePermission = hasStorageWritePermission,
+                    error = IllegalArgumentException("未提取到有效 URL")
+                )
+            )
             return
         }
 
@@ -95,6 +137,12 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                 downloadProgress = 0,
                 downloadingUrl = candidate,
                 downloadMessage = null,
+                downloadDiagnostics = buildDownloadDiagnostics(
+                    phase = "开始下载",
+                    providedText = providedText,
+                    normalizedUrl = candidate,
+                    hasStorageWritePermission = hasStorageWritePermission
+                ),
                 warningMessage = null,
                 errorMessage = null
             )
@@ -110,7 +158,7 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                     }
                 }
             }.onSuccess { result ->
-                val remainQueue = if (uiState.queuedUrls.firstOrNull() == candidate) {
+                val remainQueue = if (queuedItem != null && uiState.queuedUrls.firstOrNull() == queuedItem) {
                     uiState.queuedUrls.drop(1)
                 } else {
                     uiState.queuedUrls
@@ -122,14 +170,34 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                     downloadingUrl = null,
                     queuedUrls = remainQueue,
                     downloadMessage = "下载完成：${result.displayName}（${(sizeMb * 100).roundToInt() / 100.0} MB），已保存到相册 v-down。",
+                    downloadDiagnostics = buildDownloadDiagnostics(
+                        phase = "下载成功",
+                        providedText = providedText,
+                        normalizedUrl = candidate,
+                        hasStorageWritePermission = hasStorageWritePermission,
+                        extra = listOf(
+                            "文件名 = ${result.displayName}",
+                            "MIME = ${result.mimeType}",
+                            "字节数 = ${result.bytesWritten}",
+                            "输出 URI = ${result.outputUri}"
+                        )
+                    ),
                     errorMessage = null
                 )
             }.onFailure { error ->
+                val concise = error.message ?: "下载失败，请稍后重试。"
                 uiState = uiState.copy(
                     isDownloading = false,
                     downloadingUrl = null,
                     downloadMessage = null,
-                    errorMessage = error.message ?: "下载失败，请稍后重试。"
+                    errorMessage = concise,
+                    downloadDiagnostics = buildDownloadDiagnostics(
+                        phase = "下载失败",
+                        providedText = providedText,
+                        normalizedUrl = candidate,
+                        hasStorageWritePermission = hasStorageWritePermission,
+                        error = error
+                    )
                 )
             }
         }
@@ -256,6 +324,56 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
     private fun buildCookieExpiryWarning(result: CookieImportResult): String? {
         if (result.skippedExpiredLines <= 0) return null
         return "注意：检测到 ${result.skippedExpiredLines} 条视频站点 Cookie 已过期，已自动跳过。请重新导出最新 cookies.txt。"
+    }
+
+    private fun buildDownloadDiagnostics(
+        phase: String,
+        providedText: String,
+        normalizedUrl: String?,
+        hasStorageWritePermission: Boolean,
+        error: Throwable? = null,
+        extra: List<String> = emptyList()
+    ): String {
+        val now = System.currentTimeMillis()
+        val safeProvided = providedText.ifBlank { "(空)" }
+        val safeNormalized = normalizedUrl ?: "(未提取)"
+        val lines = mutableListOf<String>()
+        lines += "【下载诊断日志】"
+        lines += "阶段 = $phase"
+        lines += "时间戳 = $now"
+        lines += "原始输入文本 = $safeProvided"
+        lines += "提取URL = $safeNormalized"
+        lines += "写入权限标志 = $hasStorageWritePermission"
+        lines += "队列长度 = ${uiState.queuedUrls.size}"
+
+        if (extra.isNotEmpty()) {
+            lines += "附加信息:"
+            extra.forEach { lines += "- $it" }
+        }
+
+        if (error != null) {
+            val root = findRootCause(error)
+            lines += "异常类型 = ${error::class.java.name}"
+            lines += "异常信息 = ${error.message ?: "(空)"}"
+            lines += "根因类型 = ${root::class.java.name}"
+            lines += "根因信息 = ${root.message ?: "(空)"}"
+            val stack = error.stackTraceToString()
+                .lineSequence()
+                .take(24)
+                .joinToString(separator = "\n")
+            lines += "堆栈摘要(前24行):"
+            lines += stack
+        }
+
+        return lines.joinToString(separator = "\n")
+    }
+
+    private fun findRootCause(error: Throwable): Throwable {
+        var current = error
+        while (current.cause != null && current.cause !== current) {
+            current = current.cause!!
+        }
+        return current
     }
 
     private companion object {

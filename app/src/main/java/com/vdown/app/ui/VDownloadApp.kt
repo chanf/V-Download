@@ -156,8 +156,8 @@ private fun VDownloadScreen(
                     if (state.queuedUrls.isNotEmpty()) {
                         HorizontalDivider()
                         Text("待下载 URL：")
-                        state.queuedUrls.take(10).forEach { url ->
-                            Text("- $url", style = MaterialTheme.typography.bodySmall)
+                        state.queuedUrls.take(10).forEach { item ->
+                            Text("- ${item.normalizedUrl}", style = MaterialTheme.typography.bodySmall)
                         }
                     }
 
@@ -265,6 +265,37 @@ private fun VDownloadScreen(
                         modifier = Modifier.padding(16.dp),
                         color = MaterialTheme.colorScheme.error
                     )
+                }
+            }
+
+            state.downloadDiagnostics?.takeIf { it.isNotBlank() }?.let { diagnostics ->
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .pointerInput(diagnostics) {
+                            detectTapGestures(
+                                onDoubleTap = {
+                                    clipboardManager.setText(AnnotatedString(diagnostics))
+                                }
+                            )
+                        }
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            "下载诊断日志（双击复制）",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = diagnostics,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
                 }
             }
         }

@@ -1,130 +1,127 @@
 # V-Download
 
-Android 视频下载器（开发中），目标是提供统一的链接导入、任务下载与本地保存体验，支持多平台可授权内容下载。
+一个面向 Android 的视频下载工具，支持从分享文本或手动输入中提取链接，解析视频源并下载到系统相册 `Movies/v-down`。
 
-## 1. 产品设计
+## 项目角色
+- 产品经理：`feng`（`chanf@me.com`）
+- 程序员：`Codex`（基于 GPT-5 的编码代理工具）
 
-### 1.1 产品目标
-- 支持通过系统分享、粘贴或手动输入 URL 创建下载任务
-- 支持导入 `cookies.txt`（Netscape 格式）用于需要登录态的请求
+## 项目目标
+- 统一链接入口：支持系统分享和手动粘贴
+- 支持导入 `cookies.txt`（Netscape 格式）提升受登录态影响链接的可下载成功率
+- 下载文件统一保存到相册目录 `v-down`
+- 提供清晰错误提示，降低定位问题成本
+
+## 当前功能（已实现）
+
+### 1. URL 输入与提取
+- 支持从 `ACTION_SEND` 分享文本接收链接
+- 支持手动输入或粘贴链接
+- 支持从“混合文案”中提取 URL（例如抖音/小红书分享口令文本）
+- 自动清理链接尾部标点
+- 针对主流视频站短链自动 `http -> https`，避免 Android 明文流量拦截
+
+### 2. 下载能力
+- 下载进度实时展示
 - 下载完成后保存到系统相册 `Movies/v-down`
+- Android 10+ 走 MediaStore（Scoped Storage）
+- Android 9 及以下走外部存储目录写入（需写权限）
+- 下载失败会删除未完成文件，避免相册残留脏数据
 
-### 1.2 目标平台
+### 3. Cookies 导入与状态展示
+- 支持导入 Chrome 导出的 Netscape `cookies.txt`
+- 识别并筛选视频站点相关 Cookie
+- 过期 Cookie 自动跳过
+- 按视频源展示“可用/过期”统计
+- 已存储有效 Cookie 可跨多次导入保留（不会因新文件缺失而丢失历史有效项）
+
+### 4. 错误反馈体验
+- 统一中文报错
+- 遇到 `text/html` 伪视频响应会提示“可能是网页/鉴权页/风控页”
+- 底部错误卡片支持双击复制到剪贴板，方便你发我定位
+
+## 视频源支持矩阵（当前状态）
+
+### 已实现页面解析并可尝试下载
 - TikTok
-- YouTube（严格遵守平台政策，不做违规离线能力）
-- bilibili
 - 抖音
 - Instagram
+- YouTube
 - 小红书
+- X（Twitter）
 
-### 1.3 核心流程
-1. 用户从外部 App 分享链接到 V-Download，或在 App 内手动输入 URL
-2. App 识别链接并入队任务
-3. 用户可在设置页导入 `cookies.txt`
-4. 下载器执行任务，完成后写入相册 `v-down`
+### 部分支持
+- bilibili：当前主要支持 Cookie 识别与相关域名处理；复杂页面直链解析仍在完善中
 
-### 1.4 当前原型已实现
-- URL 入口：系统分享 + 手动输入 + 队列管理
-- 实际下载：HTTP 下载、进度反馈、保存到相册 `Movies/v-down`
-- Cookies 导入：文件选择、解析、入库、导入结果反馈
-- 视频站点筛选：导入后自动筛选 TikTok/YouTube/bilibili/抖音/Instagram/小红书 相关 cookies
-- 可用性标记：按视频源标注可用/过期，并展示累计可用 cookies 状态
-- 启动权限：App 启动时申请文件写入权限（Android 9 及以下）
-- 过期提示：导入时若检测到过期 Cookie，会明确提示并自动跳过
+说明：不同平台经常调整风控与页面结构，实际成功率会受链接公开性、地区网络、Cookie 时效影响。
 
-### 1.5 合规边界
-- 仅允许下载具备合法授权的内容
-- 不提供绕过 DRM、加密签名、付费墙、风控的能力
-- 优先使用平台官方能力与公开许可能力
+## 关键限制与边界
+- 仅用于下载你有权限保存的内容
+- 不提供 DRM/付费内容绕过能力
+- 若提示需要 Cookie，请先导入最新导出的 `cookies.txt`
 
-## 2. 技术栈设计
+## 使用说明
 
-### 2.1 客户端技术栈
+### 下载视频
+1. 在 App 内粘贴链接，或从其他 App 分享到 V-Download
+2. 点击“加入待下载列表”
+3. 点击“开始下载”
+4. 成功后在系统相册 `v-down` 查看
+
+### 导入 Cookies
+1. 在 Chrome 使用 `Get cookies.txt LOCALLY` 导出
+2. 打开 V-Download，点击“选择并导入 cookies.txt”
+3. 查看导入结果中的视频源可用状态
+
+## 权限说明
+- `INTERNET`：网络请求
+- `WRITE_EXTERNAL_STORAGE`（仅 Android 9 及以下）：写入本地视频文件
+
+## 技术栈
 - 语言：Kotlin
 - UI：Jetpack Compose + Material 3
-- 架构：Clean Architecture（逐步演进）
-- 状态管理：ViewModel + 单向状态流（MVI 风格）
 - 并发：Kotlin Coroutines
-- 本地数据库：Room
-- 构建：Gradle Kotlin DSL
+- 本地存储：Room
+- 构建：Gradle Kotlin DSL + KSP
+- 最低系统：Android 8.0（API 26）
 
-### 2.2 架构分层（当前）
-- `ui/`：页面、状态展示、用户交互
-- `cookie/`：Cookie 解析、导入、入库、过期清理
-- `MainActivity`：系统分享入口、启动权限申请
-
-后续将扩展为：
-- `download-engine`：任务调度、断点续传、失败重试
-- `platform-adapter-*`：平台解析适配器
-- `storage`：MediaStore 写入 `Movies/v-down`
-
-### 2.3 Cookies 设计
-- 导入格式：Netscape `cookies.txt`（支持 `#HttpOnly_`）
-- 解析字段：domain / includeSubDomains / path / secure / expires / name / value
-- 视频源筛选：仅处理 TikTok/YouTube/bilibili/抖音/Instagram/小红书 相关域名
-- 入库策略：仅存储可用项，`domain + path + name` 唯一键覆盖更新
-- 历史保留：新文件缺失的历史有效 cookies 不会被删除
-- 过期策略：导入时跳过过期项，按视频源标记并提示用户重新导出
-
-### 2.4 权限策略
-- Android 10+：使用 Scoped Storage / MediaStore，无需旧写权限
-- Android 9 及以下：启动时申请 `WRITE_EXTERNAL_STORAGE`
-
-## 3. 项目结构
-
+## 项目结构
 ```text
 app/
   src/main/java/com/vdown/app/
     MainActivity.kt
+    download/VideoDownloadRepository.kt
     cookie/
       AppDatabase.kt
       CookieDao.kt
       CookieEntity.kt
       CookieImportRepository.kt
-      CookieModels.kt
       NetscapeCookieParser.kt
+      VideoCookieSources.kt
     ui/
-      CookieImportViewModel.kt
       VDownloadApp.kt
-      theme/
-  src/main/AndroidManifest.xml
-  src/test/java/com/vdown/app/cookie/
-
-docs/
-  product-tech-design.md
+      CookieImportViewModel.kt
 ```
 
-## 4. 本地开发
+## 构建与打包
 
-### 4.1 环境要求
-- JDK 17+
-- Android SDK（已安装对应 Build Tools / Platform）
+### 常用命令
+- Debug 编译：`./gradlew :app:compileDebugKotlin`
+- 单元测试：`./gradlew :app:testDebugUnitTest`
+- Release 打包：`./gradlew :app:assembleRelease`
 
-### 4.2 构建命令
-- Debug 包：`./gradlew assembleDebug`
-- Release 包：`./gradlew assembleRelease`
-- 单元测试：`./gradlew testDebugUnitTest`
-
-### 4.3 Release 签名
-项目通过根目录 `keystore.properties` 读取签名配置（该文件已被 `.gitignore` 忽略）。
-
-需要字段：
+### Release 签名
+通过项目根目录 `keystore.properties` 提供：
 - `KEY_ALIAS`
 - `KEY_PASSWORD`
 - `STORE_FILE`
 - `STORE_PASSWORD`
 
-## 5. 里程碑
+## 质量检查（提交前建议）
+- 快速检查：`compileDebugKotlin + 核心单测`
+- 网络相关长测建议单独运行，避免阻塞常规提交
 
-### M1（已完成）
-- 项目脚手架（Compose + Room）
-- URL 导入入口与基础下载链路
-- Cookies 导入与过期提示
+## 版本约定
+- 默认每次打包仅升级 `versionName` 第三段（patch）
+- 同时递增 `versionCode` 以保证可覆盖安装
 
-### M2（进行中）
-- 下载任务增强（重试、断点续传）
-- 平台级解析与可下载链接提取
-
-### M3（待开始）
-- 多平台适配器与端到端联调
-- 合规网关与策略开关

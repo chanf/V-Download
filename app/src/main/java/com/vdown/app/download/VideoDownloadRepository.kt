@@ -14,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.HttpURLConnection
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.net.URL
 import java.nio.charset.StandardCharsets
@@ -22,6 +23,7 @@ private const val MOVIES_RELATIVE_PATH = "Movies/v-down"
 private const val DEFAULT_MIME_TYPE = "video/mp4"
 private const val BUFFER_SIZE = 8 * 1024
 private const val MAX_REDIRECT_FOLLOWS = 8
+private const val MAX_YOUTUBE_CANDIDATE_PROBES = 10
 private const val MOBILE_SAFARI_UA =
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 private const val ANDROID_CHROME_UA =
@@ -68,9 +70,16 @@ private val YOUTUBE_VIDEO_URL_PATTERNS = listOf(
     Regex(""""url"\s*:\s*"(https?://[^"]*googlevideo[^"]*)"""", RegexOption.IGNORE_CASE)
 )
 private val YOUTUBE_INNERTUBE_API_KEY_PATTERNS = listOf(
+    Regex("""['"]INNERTUBE_API_KEY['"]\s*:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE),
     Regex("""\"INNERTUBE_API_KEY\"\s*:\s*\"([^\"]+)\"""", RegexOption.IGNORE_CASE),
+    Regex("""['"]innertubeApiKey['"]\s*:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE),
     Regex("""\"innertubeApiKey\"\s*:\s*\"([^\"]+)\"""", RegexOption.IGNORE_CASE),
     Regex("""INNERTUBE_API_KEY\\\":\\\"([^\\\"]+)""", RegexOption.IGNORE_CASE)
+)
+private val YOUTUBE_SIGNATURE_CIPHER_PATTERNS = listOf(
+    Regex("""\\\"(?:signatureCipher|cipher)\\\"\s*:\s*\\\"(.*?)\\\"""", RegexOption.IGNORE_CASE),
+    Regex(""""(?:signatureCipher|cipher)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE),
+    Regex("""['"](?:signatureCipher|cipher)['"]\s*:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
 )
 private val X_VIDEO_VARIANT_PATTERNS = listOf(
     Regex("""['"](?:content_type|type)['"]\s*:\s*['"]video/mp4['"][^{}]{0,320}?['"](?:url|src)['"]\s*:\s*['"]([^'"]+)['"]""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)),
@@ -583,17 +592,21 @@ class VideoDownloadRepository(
             candidates += "https://m.youtube.com/watch?v=$it"
         }
 
+        var fallbackCandidate: String? = null
         candidates.forEach { pageUrl ->
             val page = fetchYouTubePage(pageUrl)
-            val resolved = extractYouTubeVideoUrlFromPage(page)
-            if (!resolved.isNullOrBlank()) {
-                return resolved
+            val pageCandidates = extractYouTubeVideoCandidatesFromPage(page)
+            selectReachableYouTubeCandidate(pageCandidates)?.let { return it }
+            if (fallbackCandidate.isNullOrBlank()) {
+                fallbackCandidate = bestYouTubeCandidate(pageCandidates)
             }
         }
 
         if (!videoId.isNullOrBlank()) {
             resolveYouTubeViaInnertube(source = "https://www.youtube.com/watch?v=$videoId", videoId = videoId)?.let { return it }
         }
+
+        fallbackCandidate?.let { return it }
 
         throw IllegalStateException(
             "下载失败：YouTube 页面未解析到视频直链。请确认链接可公开访问，或导入可用的 YouTube Cookies 后重试。"
@@ -790,11 +803,34 @@ class VideoDownloadRepository(
         val sourcePage = fetchYouTubePage(source)
         val apiKey = extractYouTubeInnertubeApiKey(sourcePage) ?: return null
 
+        var fallbackCandidate: String? = null
+
         val androidResponse = fetchYouTubePlayerApi(apiKey = apiKey, videoId = videoId, clientName = "ANDROID")
-        extractYouTubeVideoUrlFromPlayerApi(androidResponse)?.let { return it }
+        val androidCandidates = extractYouTubeVideoCandidatesFromPlayerApi(androidResponse)
+        selectReachableYouTubeCandidate(androidCandidates)?.let { return it }
+        if (fallbackCandidate.isNullOrBlank()) {
+            fallbackCandidate = bestYouTubeCandidate(androidCandidates)
+        }
 
         val iosResponse = fetchYouTubePlayerApi(apiKey = apiKey, videoId = videoId, clientName = "IOS")
-        return extractYouTubeVideoUrlFromPlayerApi(iosResponse)
+        val iosCandidates = extractYouTubeVideoCandidatesFromPlayerApi(iosResponse)
+        selectReachableYouTubeCandidate(iosCandidates)?.let { return it }
+        if (fallbackCandidate.isNullOrBlank()) {
+            fallbackCandidate = bestYouTubeCandidate(iosCandidates)
+        }
+
+        val tvResponse = fetchYouTubePlayerApi(
+            apiKey = apiKey,
+            videoId = videoId,
+            clientName = "TVHTML5_SIMPLY_EMBEDDED_PLAYER"
+        )
+        val tvCandidates = extractYouTubeVideoCandidatesFromPlayerApi(tvResponse)
+        selectReachableYouTubeCandidate(tvCandidates)?.let { return it }
+        if (fallbackCandidate.isNullOrBlank()) {
+            fallbackCandidate = bestYouTubeCandidate(tvCandidates)
+        }
+
+        return fallbackCandidate
     }
 
     private fun extractTikwmVideoUrlFromApiResponse(content: String): String? {
@@ -872,6 +908,23 @@ class VideoDownloadRepository(
                 """.trimIndent()
             }
 
+            "TVHTML5_SIMPLY_EMBEDDED_PLAYER" -> {
+                """
+                {
+                  "context": {
+                    "client": {
+                      "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                      "clientVersion": "2.0",
+                      "clientScreen": "EMBED"
+                    }
+                  },
+                  "videoId": "$videoId",
+                  "contentCheckOk": true,
+                  "racyCheckOk": true
+                }
+                """.trimIndent()
+            }
+
             else -> return ""
         }
 
@@ -928,17 +981,171 @@ class VideoDownloadRepository(
     }
 
     private fun extractYouTubeVideoUrlFromPlayerApi(content: String): String? {
+        return bestYouTubeCandidate(extractYouTubeVideoCandidatesFromPlayerApi(content))
+    }
+
+    private fun extractYouTubeVideoCandidatesFromPlayerApi(content: String): List<String> {
         val status = Regex(
             """(?is)"playabilityStatus"\s*:\s*\{.*?"status"\s*:\s*"([A-Z_]+)""""
         ).find(content)?.groupValues?.getOrNull(1)
         if (status != null && status != "OK") {
-            return null
+            return emptyList()
         }
 
-        extractFirstValidVideoUrl(content, YOUTUBE_VIDEO_URL_PATTERNS, ::isLikelyYouTubeVideoUrl)?.let { return it }
+        val candidates = linkedSetOf<String>()
+        candidates += extractAllValidVideoUrls(content, YOUTUBE_VIDEO_URL_PATTERNS, ::isLikelyYouTubeVideoUrl)
         val normalized = normalizeEscapedContent(content)
-        extractFirstValidVideoUrl(normalized, YOUTUBE_VIDEO_URL_PATTERNS, ::isLikelyYouTubeVideoUrl)?.let { return it }
-        return extractBestMatchingHttpUrl(normalized, ::isLikelyYouTubeVideoUrl)
+        candidates += extractAllValidVideoUrls(normalized, YOUTUBE_VIDEO_URL_PATTERNS, ::isLikelyYouTubeVideoUrl)
+        candidates += extractYouTubeUrlsFromSignatureCipher(content)
+        candidates += extractYouTubeUrlsFromSignatureCipher(normalized)
+        candidates += extractAllMatchingHttpUrls(normalized, ::isLikelyYouTubeVideoUrl)
+        return normalizeYouTubeCandidates(candidates)
+    }
+
+    private fun extractYouTubeUrlsFromSignatureCipher(content: String): List<String> {
+        val candidates = linkedSetOf<String>()
+
+        YOUTUBE_SIGNATURE_CIPHER_PATTERNS.forEach { pattern ->
+            pattern.findAll(content).forEach { match ->
+                val rawCipher = match.groupValues.getOrNull(1).orEmpty()
+                val decodedCipher = decodeEscapedUrl(rawCipher)
+                val candidate = buildYouTubeUrlFromCipher(decodedCipher)
+                if (!candidate.isNullOrBlank() && isLikelyYouTubeVideoUrl(candidate)) {
+                    candidates += candidate
+                }
+            }
+        }
+
+        return normalizeYouTubeCandidates(candidates)
+    }
+
+    private fun normalizeYouTubeCandidates(candidates: Collection<String>): List<String> {
+        if (candidates.isEmpty()) return emptyList()
+
+        return candidates.asSequence()
+            .map(::sanitizeHttpUrl)
+            .filter { isLikelyYouTubeVideoUrl(it) }
+            .distinct()
+            .sortedByDescending(::youtubeCandidateRank)
+            .toList()
+    }
+
+    private fun bestYouTubeCandidate(candidates: Collection<String>): String? {
+        return normalizeYouTubeCandidates(candidates).firstOrNull()
+    }
+
+    private suspend fun selectReachableYouTubeCandidate(candidates: Collection<String>): String? {
+        val ordered = normalizeYouTubeCandidates(candidates)
+        if (ordered.isEmpty()) return null
+
+        ordered.take(MAX_YOUTUBE_CANDIDATE_PROBES).forEach { candidate ->
+            if (isYouTubeCandidateReachable(candidate)) {
+                return candidate
+            }
+        }
+        return null
+    }
+
+    private fun isYouTubeCandidateReachable(url: String): Boolean {
+        return runCatching {
+            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = true
+                requestMethod = "GET"
+                connectTimeout = 12_000
+                readTimeout = 15_000
+                setRequestProperty("User-Agent", ANDROID_CHROME_UA)
+                setRequestProperty("Accept", "*/*")
+                setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+                setRequestProperty("Accept-Encoding", "identity")
+                setRequestProperty("Range", "bytes=0-1")
+                setRequestProperty("Referer", "https://www.youtube.com/")
+                setRequestProperty("Origin", "https://www.youtube.com")
+            }
+
+            try {
+                val code = connection.responseCode
+                if (code !in 200..299 && code != 206) {
+                    return@runCatching false
+                }
+
+                val mimeType = connection.contentType
+                    ?.substringBefore(';')
+                    ?.trim()
+                    ?.lowercase()
+                    .orEmpty()
+                if (mimeType.startsWith("video/")) {
+                    return@runCatching true
+                }
+                if ((mimeType == "application/octet-stream" || mimeType == "binary/octet-stream") &&
+                    isLikelyYouTubeVideoUrl(url)
+                ) {
+                    return@runCatching true
+                }
+                return@runCatching mimeType.isBlank() && isLikelyYouTubeVideoUrl(url)
+            } finally {
+                connection.disconnect()
+            }
+        }.getOrDefault(false)
+    }
+
+    private fun youtubeCandidateRank(url: String): Int {
+        var score = videoQualityScore(url)
+        val lower = url.lowercase()
+        when {
+            lower.contains("mime=video%2fmp4") || lower.contains("mime=video/mp4") -> score += 12_000_000
+            lower.contains("mime=video%2fwebm") || lower.contains("mime=video/webm") -> score += 8_000_000
+        }
+
+        val itag = Regex("""(?:[?&])itag=([0-9]{1,4})""", RegexOption.IGNORE_CASE)
+            .find(url)
+            ?.groupValues
+            ?.getOrNull(1)
+        if (!itag.isNullOrBlank()) {
+            score += youtubePreferredItagScore[itag] ?: 0
+        }
+
+        return score
+    }
+
+    private fun buildYouTubeUrlFromCipher(cipher: String): String? {
+        val params = parseQueryParams(cipher)
+        val baseUrl = params["url"]?.takeIf { it.startsWith("https://") || it.startsWith("http://") } ?: return null
+
+        if (baseUrl.contains("sig=", ignoreCase = true) || baseUrl.contains("signature=", ignoreCase = true)) {
+            return baseUrl
+        }
+
+        val signature = params["sig"] ?: params["signature"] ?: return baseUrl
+        val sp = params["sp"].orEmpty().ifBlank { "signature" }
+        return appendQueryParam(baseUrl, sp, signature)
+    }
+
+    private fun parseQueryParams(query: String): Map<String, String> {
+        val result = linkedMapOf<String, String>()
+        query.split('&').forEach { pair ->
+            if (pair.isBlank()) return@forEach
+            val idx = pair.indexOf('=')
+            val keyRaw = if (idx >= 0) pair.substring(0, idx) else pair
+            val valueRaw = if (idx >= 0) pair.substring(idx + 1) else ""
+            val key = decodeQueryPart(keyRaw)
+            val value = decodeQueryPart(valueRaw)
+            if (key.isNotBlank()) {
+                result[key] = value
+            }
+        }
+        return result
+    }
+
+    private fun decodeQueryPart(raw: String): String {
+        return runCatching {
+            URLDecoder.decode(raw, StandardCharsets.UTF_8.toString())
+        }.getOrDefault(raw)
+    }
+
+    private fun appendQueryParam(url: String, key: String, value: String): String {
+        val separator = if (url.contains("?")) "&" else "?"
+        val encodedValue = URLEncoder.encode(value, StandardCharsets.UTF_8.toString())
+        return "$url$separator$key=$encodedValue"
     }
 
     private suspend fun fetchWebPage(
@@ -1126,14 +1333,20 @@ class VideoDownloadRepository(
     }
 
     private fun extractYouTubeVideoUrlFromPage(content: String): String? {
-        extractFirstValidVideoUrl(content, YOUTUBE_VIDEO_URL_PATTERNS, ::isLikelyYouTubeVideoUrl)?.let { return it }
+        return bestYouTubeCandidate(extractYouTubeVideoCandidatesFromPage(content))
+    }
+
+    private fun extractYouTubeVideoCandidatesFromPage(content: String): List<String> {
+        val candidates = linkedSetOf<String>()
+        candidates += extractAllValidVideoUrls(content, YOUTUBE_VIDEO_URL_PATTERNS, ::isLikelyYouTubeVideoUrl)
 
         val normalized = normalizeEscapedContent(content)
         if (normalized != content) {
-            extractFirstValidVideoUrl(normalized, YOUTUBE_VIDEO_URL_PATTERNS, ::isLikelyYouTubeVideoUrl)?.let { return it }
+            candidates += extractAllValidVideoUrls(normalized, YOUTUBE_VIDEO_URL_PATTERNS, ::isLikelyYouTubeVideoUrl)
         }
 
-        return extractBestMatchingHttpUrl(normalized, ::isLikelyYouTubeVideoUrl)
+        candidates += extractAllMatchingHttpUrls(normalized, ::isLikelyYouTubeVideoUrl)
+        return normalizeYouTubeCandidates(candidates)
     }
 
     private fun extractXVideoUrlFromApi(content: String): String? {
@@ -1168,15 +1381,39 @@ class VideoDownloadRepository(
         predicate: ((String) -> Boolean)? = null
     ): String? {
         for (pattern in patterns) {
-            val rawMatch = pattern.find(content)?.groupValues?.getOrNull(1) ?: continue
-            val decoded = decodeEscapedUrl(rawMatch)
-            if ((decoded.startsWith("https://") || decoded.startsWith("http://")) &&
-                (predicate == null || predicate(decoded))
-            ) {
-                return decoded
+            pattern.findAll(content).forEach { match ->
+                val rawMatch = match.groupValues.getOrNull(1).orEmpty()
+                if (rawMatch.isBlank()) return@forEach
+                val decoded = decodeEscapedUrl(rawMatch)
+                if ((decoded.startsWith("https://") || decoded.startsWith("http://")) &&
+                    (predicate == null || predicate(decoded))
+                ) {
+                    return decoded
+                }
             }
         }
         return null
+    }
+
+    private fun extractAllValidVideoUrls(
+        content: String,
+        patterns: List<Regex>,
+        predicate: ((String) -> Boolean)? = null
+    ): List<String> {
+        val candidates = linkedSetOf<String>()
+        patterns.forEach patternLoop@{ pattern ->
+            pattern.findAll(content).forEach matchLoop@{ match ->
+                val rawMatch = match.groupValues.getOrNull(1).orEmpty()
+                if (rawMatch.isBlank()) return@matchLoop
+                val decoded = decodeEscapedUrl(rawMatch)
+                if ((decoded.startsWith("https://") || decoded.startsWith("http://")) &&
+                    (predicate == null || predicate(decoded))
+                ) {
+                    candidates += decoded
+                }
+            }
+        }
+        return candidates.toList()
     }
 
     private fun normalizeEscapedContent(content: String): String {
@@ -1230,6 +1467,20 @@ class VideoDownloadRepository(
         }
         if (candidates.isEmpty()) return null
         return candidates.maxByOrNull(::videoQualityScore)
+    }
+
+    private fun extractAllMatchingHttpUrls(
+        content: String,
+        predicate: (String) -> Boolean
+    ): List<String> {
+        val candidates = linkedSetOf<String>()
+        HTTP_URL_PATTERN.findAll(content).forEach { match ->
+            val candidate = decodeEscapedUrl(match.value).trimEnd('\\', ',', ';')
+            if (predicate(candidate)) {
+                candidates += candidate
+            }
+        }
+        return candidates.toList()
     }
 
     private fun isLikelyTikTokVideoUrl(url: String): Boolean {
@@ -1303,7 +1554,15 @@ class VideoDownloadRepository(
         if (!lower.contains("googlevideo.com")) return false
         if (!lower.contains("/videoplayback")) return false
         if (lower.contains("generate_204") || lower.contains("initplayback")) return false
-        return lower.contains("mime=video%2f") || lower.contains("mime=video/")
+        if (lower.contains("mime=audio%2f") || lower.contains("mime=audio/")) return false
+
+        val itag = Regex("""(?:[?&])itag=([0-9]{1,4})""", RegexOption.IGNORE_CASE)
+            .find(url)
+            ?.groupValues
+            ?.getOrNull(1)
+        if (!itag.isNullOrBlank() && itag in youtubeAudioOnlyItags) return false
+
+        return true
     }
 
     private fun isLikelyXVideoUrl(url: String): Boolean {
@@ -1482,6 +1741,22 @@ class VideoDownloadRepository(
             "3gp" to "video/3gpp",
             "ts" to "video/mp2t",
             "m2ts" to "video/mp2t"
+        )
+        val youtubeAudioOnlyItags = setOf(
+            "139", "140", "141", "171", "249", "250", "251", "256", "258", "325", "328", "599", "600"
+        )
+        val youtubePreferredItagScore = mapOf(
+            "22" to 6_000_000,   // 720p mp4 progressive
+            "18" to 5_500_000,   // 360p mp4 progressive
+            "37" to 5_000_000,   // 1080p mp4 progressive (rare)
+            "136" to 4_200_000,  // 720p mp4 video-only
+            "135" to 4_000_000,  // 480p mp4 video-only
+            "134" to 3_800_000,  // 360p mp4 video-only
+            "137" to 3_600_000,  // 1080p mp4 video-only
+            "398" to 3_400_000,  // av01 720p
+            "399" to 3_200_000,  // av01 1080p
+            "247" to 2_800_000,  // webm 720p
+            "248" to 2_600_000   // webm 1080p
         )
         val cleartextRestrictedDomainSuffixes = setOf(
             "instagram.com",
