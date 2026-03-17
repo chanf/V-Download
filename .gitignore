@@ -1,0 +1,32 @@
+# Gradle
+.gradle/
+**/build/
+/.kotlin/
+
+# Local machine config
+local.properties
+keystore.properties
+*.jks
+*.keystore
+*.pem
+
+# IDE
+.idea/
+*.iml
+
+# Android / NDK
+.externalNativeBuild/
+.cxx/
+captures/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local test/output artifacts
+video/
+*.apk
+*.aab
+
+# Sensitive local data
+Cookies/*.txt

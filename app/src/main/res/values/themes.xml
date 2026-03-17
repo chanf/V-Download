@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.VDownload" parent="Theme.AppCompat.DayNight.NoActionBar" />
+</resources>
