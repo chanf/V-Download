@@ -25,6 +25,9 @@ Thumbs.db
 
 # Local test/output artifacts
 video/
+artifacts/
+models/
+qa/download_automation/reports/
 *.apk
 *.aab
 

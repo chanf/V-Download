@@ -111,7 +111,7 @@
 - 幂等任务：同一链接+清晰度生成稳定 `taskHash`，避免重复下载
 - 断点续传：基于 `Range` 与 `ETag/Last-Modified` 校验
 - 网络策略：仅 Wi-Fi、低电量暂停、漫游限制
-- 存储策略：成品视频统一写入 `Movies/v-down`（MediaStore `RELATIVE_PATH`），确保在相册可见
+- 存储策略：成品视频统一写入 `DCIM/v-down`（MediaStore `RELATIVE_PATH`），确保在相册可见
 - 可观测性：统一事件埋点（解析耗时、重试次数、失败原因）
 
 ### 4.5 合规网关设计
@@ -130,7 +130,7 @@
 - `status: enum`
 - `progress: Int`
 - `filePath: String?`
-- `relativePath: String`（默认 `Movies/v-down`）
+- `relativePath: String`（默认 `DCIM/v-down`）
 - `quality: String?`
 - `createdAt: Long`
 - `updatedAt: Long`

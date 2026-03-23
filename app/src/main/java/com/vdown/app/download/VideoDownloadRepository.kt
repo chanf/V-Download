@@ -6,24 +6,35 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.util.Log
 import android.webkit.MimeTypeMap
 import com.vdown.app.cookie.CookieDao
 import com.vdown.app.cookie.CookieEntity
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
-private const val MOVIES_RELATIVE_PATH = "Movies/v-down"
+private const val DOWNLOAD_RELATIVE_PATH = "DCIM/v-down"
 private const val DEFAULT_MIME_TYPE = "video/mp4"
 private const val BUFFER_SIZE = 8 * 1024
 private const val MAX_REDIRECT_FOLLOWS = 8
 private const val MAX_YOUTUBE_CANDIDATE_PROBES = 10
+private const val PARALLEL_DOWNLOAD_MIN_BYTES = 4L * 1024L * 1024L
+private const val PARALLEL_DOWNLOAD_TARGET_SEGMENT_BYTES = 2L * 1024L * 1024L
+private const val PARALLEL_DOWNLOAD_MAX_SEGMENTS = 6
+private const val PARALLEL_DOWNLOAD_MIN_SEGMENTS = 2
 private const val MOBILE_SAFARI_UA =
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 private const val ANDROID_CHROME_UA =
@@ -65,6 +76,11 @@ private val XIAOHONGSHU_VIDEO_URL_PATTERNS = listOf(
     Regex(""""(?:masterUrl|master_url|video_url|videoUrl|playUrl|play_url|h264Url|h265Url)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE),
     Regex("""['"](?:masterUrl|master_url|video_url|videoUrl|playUrl|play_url|h264Url|h265Url)['"]\s*:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
 )
+private val BILIBILI_VIDEO_URL_PATTERNS = listOf(
+    Regex("""\\\"(?:baseUrl|base_url|url)\\\"\s*:\s*\\\"(.*?)\\\"""", RegexOption.IGNORE_CASE),
+    Regex(""""(?:baseUrl|base_url|url)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE),
+    Regex("""['"](?:baseUrl|base_url|url)['"]\s*:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
+)
 private val YOUTUBE_VIDEO_URL_PATTERNS = listOf(
     Regex("""\\\"url\\\"\s*:\s*\\\"(https?:\\\\?/\\\\?/[^"\\]*googlevideo[^"\\]*)\\\"""", RegexOption.IGNORE_CASE),
     Regex(""""url"\s*:\s*"(https?://[^"]*googlevideo[^"]*)"""", RegexOption.IGNORE_CASE)
@@ -94,16 +110,23 @@ private val DOUYIN_ITEM_ID_PATTERNS = listOf(
     Regex("""(?:item_id|itemId|aweme_id|modal_id)["=: ]+"?(\d{6,30})""", RegexOption.IGNORE_CASE)
 )
 private val XIAOHONGSHU_NOTE_ID_PATTERN = Regex("""(?:/explore/|/discovery/item/)([0-9a-zA-Z]{12,32})""", RegexOption.IGNORE_CASE)
+private val BILIBILI_BVID_PATTERN = Regex("""(?:/video/|\b)(BV[0-9A-Za-z]{10})""", RegexOption.IGNORE_CASE)
+private val BILIBILI_AID_PATTERN = Regex("""(?:/video/|\b)av(\d{4,20})""", RegexOption.IGNORE_CASE)
+private val BILIBILI_PAGE_NUMBER_PATTERN = Regex("""(?:[?&])p=(\d{1,4})""", RegexOption.IGNORE_CASE)
 private val YOUTUBE_VIDEO_ID_PATTERN = Regex("""(?:(?:v=|/shorts/|/embed/|youtu\.be/)([A-Za-z0-9_-]{6,20}))""", RegexOption.IGNORE_CASE)
 private val X_STATUS_ID_PATTERN = Regex("""(?:/i/status/|/status/)(\d{6,30})""", RegexOption.IGNORE_CASE)
 private val UNICODE_ESCAPE_PATTERN = Regex("""\\u([0-9a-fA-F]{4})""")
+private const val LOG_TAG = "VDownDownload"
 
 data class VideoDownloadResult(
     val sourceUrl: String,
     val displayName: String,
     val mimeType: String,
     val outputUri: Uri,
-    val bytesWritten: Long
+    val bytesWritten: Long,
+    val resolvedVideoUrl: String,
+    val finalRequestUrl: String,
+    val watermarkPenalty: Int?
 )
 
 private data class DownloadOpenResult(
@@ -126,16 +149,22 @@ class VideoDownloadRepository(
         if (!normalizedSourceInput.startsWith("http://") && !normalizedSourceInput.startsWith("https://")) {
             throw IllegalArgumentException("仅支持 http/https 链接")
         }
+        Log.i(LOG_TAG, "download start source=$normalizedSourceInput")
 
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P && !hasStorageWritePermission) {
             throw IllegalStateException("未授予文件写入权限，无法保存视频")
         }
 
         var resolvedSourceUrl = resolveSourceUrlForDownload(normalizedSourceInput)
+        Log.i(LOG_TAG, "resolved source source=$normalizedSourceInput resolved=$resolvedSourceUrl")
         var openResult = openDownloadConnection(resolvedSourceUrl)
         var connection = openResult.connection
         var contentLength = openResult.contentLength
         var responseMimeType = openResult.responseMimeType
+        Log.i(
+            LOG_TAG,
+            "open connection source=$normalizedSourceInput final=${openResult.finalUrl} mime=$responseMimeType contentLength=$contentLength"
+        )
 
         var preliminaryFileName = resolveDisplayName(
             connection = connection,
@@ -157,10 +186,15 @@ class VideoDownloadRepository(
 
             connection.disconnect()
             resolvedSourceUrl = retryResolvedSourceUrl
+            Log.i(LOG_TAG, "retry resolve for html source=$normalizedSourceInput resolved=$resolvedSourceUrl")
             openResult = openDownloadConnection(resolvedSourceUrl)
             connection = openResult.connection
             contentLength = openResult.contentLength
             responseMimeType = openResult.responseMimeType
+            Log.i(
+                LOG_TAG,
+                "retry open connection source=$normalizedSourceInput final=${openResult.finalUrl} mime=$responseMimeType contentLength=$contentLength"
+            )
             preliminaryFileName = resolveDisplayName(
                 connection = connection,
                 sourceUrl = normalizedSourceInput,
@@ -172,6 +206,7 @@ class VideoDownloadRepository(
                 sourceUrl = normalizedSourceInput
             )
         }
+        val watermarkPenalty = resolveWatermarkPenalty(resolvedSourceUrl)
 
         val finalMimeType = mimeType ?: throw IllegalStateException(
             buildNonVideoMimeError(
@@ -183,47 +218,110 @@ class VideoDownloadRepository(
 
         val targetUri = createTargetUri(context, fileName, finalMimeType)
         var bytesWritten = 0L
-        var lastProgress = -1
+        var lastProgress: Int
+        var usedParallelDownload = false
+        var parallelTempFile: File? = null
 
         try {
-            context.contentResolver.openOutputStream(targetUri, "w")?.use { output ->
-                connection.inputStream.use { input ->
-                    val buffer = ByteArray(BUFFER_SIZE)
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read <= 0) break
-                        output.write(buffer, 0, read)
-                        bytesWritten += read
-
-                        if (contentLength > 0) {
-                            val progress = ((bytesWritten * 100) / contentLength).toInt().coerceIn(0, 100)
-                            if (progress != lastProgress) {
-                                lastProgress = progress
-                                onProgress(progress)
-                            }
-                        }
-                    }
-                    output.flush()
+            val canUseParallel = shouldUseParallelDownload(
+                connection = connection,
+                finalUrl = openResult.finalUrl,
+                contentLength = contentLength
+            )
+            if (canUseParallel) {
+                usedParallelDownload = true
+                connection.disconnect()
+                parallelTempFile = runCatching {
+                    downloadInParallelToTempFile(
+                        context = context,
+                        finalUrl = openResult.finalUrl,
+                        totalBytes = contentLength,
+                        onProgress = onProgress
+                    )
+                }.getOrElse { error ->
+                    Log.w(
+                        LOG_TAG,
+                        "parallel download failed, fallback single stream final=${openResult.finalUrl} message=${error.message}",
+                        error
+                    )
+                    null
                 }
-            } ?: throw IllegalStateException("无法写入目标文件")
+
+                val readyTempFile = parallelTempFile
+                if (readyTempFile != null) {
+                    bytesWritten = writeTempFileToTargetUri(context, targetUri, readyTempFile)
+                    lastProgress = 100
+                } else {
+                    openResult = openDownloadConnection(resolvedSourceUrl)
+                    connection = openResult.connection
+                    contentLength = openResult.contentLength
+                    responseMimeType = openResult.responseMimeType
+                    val streamResult = streamConnectionToTargetUri(
+                        context = context,
+                        targetUri = targetUri,
+                        connection = connection,
+                        contentLength = contentLength,
+                        onProgress = onProgress
+                    )
+                    bytesWritten = streamResult.first
+                    lastProgress = streamResult.second
+                    usedParallelDownload = false
+                }
+            } else {
+                val streamResult = streamConnectionToTargetUri(
+                    context = context,
+                    targetUri = targetUri,
+                    connection = connection,
+                    contentLength = contentLength,
+                    onProgress = onProgress
+                )
+                bytesWritten = streamResult.first
+                lastProgress = streamResult.second
+            }
+
+            if (bytesWritten <= 0L) {
+                throw IllegalStateException(
+                    "下载失败：视频流为空（0 字节）。可能链接已过期、鉴权失败或触发风控，请更新 Cookies 后重试。"
+                )
+            }
+            if (contentLength > 0 && bytesWritten < contentLength) {
+                throw IllegalStateException(
+                    "下载失败：视频下载不完整（期望 $contentLength 字节，实际 $bytesWritten 字节）。请重试或更新 Cookies。"
+                )
+            }
 
             if (lastProgress < 100) {
                 onProgress(100)
             }
 
             finalizePendingIfNeeded(context, targetUri)
+            Log.i(
+                LOG_TAG,
+                "download success bytes=$bytesWritten mime=$finalMimeType mode=${if (usedParallelDownload) "parallel" else "single"} source=$normalizedSourceInput resolved=$resolvedSourceUrl final=${openResult.finalUrl} watermarkPenalty=${watermarkPenalty ?: "N/A"}"
+            )
 
             VideoDownloadResult(
                 sourceUrl = normalizedSourceInput,
                 displayName = fileName,
                 mimeType = finalMimeType,
                 outputUri = targetUri,
-                bytesWritten = bytesWritten
+                bytesWritten = bytesWritten,
+                resolvedVideoUrl = resolvedSourceUrl,
+                finalRequestUrl = openResult.finalUrl,
+                watermarkPenalty = watermarkPenalty
             )
         } catch (error: Exception) {
+            Log.e(
+                LOG_TAG,
+                "download failed source=$normalizedSourceInput resolved=$resolvedSourceUrl final=${openResult.finalUrl} bytes=$bytesWritten mime=$responseMimeType message=${error.message}",
+                error
+            )
             context.contentResolver.delete(targetUri, null, null)
             throw error
         } finally {
+            parallelTempFile?.let { file ->
+                runCatching { file.delete() }
+            }
             connection.disconnect()
         }
     }
@@ -295,6 +393,254 @@ class VideoDownloadRepository(
         }
 
         throw IllegalStateException("下载失败：重定向次数超过上限（$MAX_REDIRECT_FOLLOWS）")
+    }
+
+    private suspend fun streamConnectionToTargetUri(
+        context: Context,
+        targetUri: Uri,
+        connection: HttpURLConnection,
+        contentLength: Long,
+        onProgress: suspend (Int) -> Unit
+    ): Pair<Long, Int> {
+        var bytesWritten = 0L
+        var lastProgress = -1
+
+        context.contentResolver.openOutputStream(targetUri, "w")?.use { output ->
+            connection.inputStream.use { input ->
+                val buffer = ByteArray(BUFFER_SIZE)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    output.write(buffer, 0, read)
+                    bytesWritten += read
+
+                    if (contentLength > 0) {
+                        val progress = ((bytesWritten * 100) / contentLength).toInt().coerceIn(0, 100)
+                        if (progress != lastProgress) {
+                            lastProgress = progress
+                            onProgress(progress)
+                        }
+                    }
+                }
+                output.flush()
+            }
+        } ?: throw IllegalStateException("无法写入目标文件")
+
+        return bytesWritten to lastProgress
+    }
+
+    private suspend fun shouldUseParallelDownload(
+        connection: HttpURLConnection,
+        finalUrl: String,
+        contentLength: Long
+    ): Boolean {
+        if (contentLength < PARALLEL_DOWNLOAD_MIN_BYTES) return false
+
+        val acceptRanges = connection.getHeaderField("Accept-Ranges")
+            ?.trim()
+            ?.lowercase()
+            .orEmpty()
+        if (acceptRanges.contains("bytes")) {
+            return true
+        }
+
+        return probeRangeSupport(finalUrl)
+    }
+
+    private suspend fun probeRangeSupport(finalUrl: String): Boolean {
+        val url = URL(finalUrl)
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            instanceFollowRedirects = true
+            requestMethod = "GET"
+            connectTimeout = 20_000
+            readTimeout = 30_000
+            setRequestProperty("User-Agent", ANDROID_CHROME_UA)
+            setRequestProperty("Accept", "*/*")
+            setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+            setRequestProperty("Accept-Encoding", "identity")
+            setRequestProperty("Range", "bytes=0-0")
+            applySourceSpecificRequestHeaders(this, url)
+        }
+        val cookieHeader = buildCookieHeader(url)
+        if (cookieHeader.isNotBlank()) {
+            connection.setRequestProperty("Cookie", cookieHeader)
+        }
+
+        return try {
+            val code = connection.responseCode
+            code == 206 || connection.getHeaderField("Content-Range")
+                ?.lowercase()
+                ?.startsWith("bytes 0-0/")
+                ?: false
+        } catch (_: Exception) {
+            false
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private suspend fun downloadInParallelToTempFile(
+        context: Context,
+        finalUrl: String,
+        totalBytes: Long,
+        onProgress: suspend (Int) -> Unit
+    ): File = coroutineScope {
+        if (totalBytes <= 0L) {
+            throw IllegalStateException("无法并发下载：未知内容长度")
+        }
+
+        val segmentCount = computeParallelSegmentCount(totalBytes)
+        if (segmentCount < PARALLEL_DOWNLOAD_MIN_SEGMENTS) {
+            throw IllegalStateException("无法并发下载：分片数不足")
+        }
+
+        val segmentSize = ((totalBytes + segmentCount - 1) / segmentCount).coerceAtLeast(1L)
+        val tempFile = File.createTempFile("vdown_parallel_", ".part", context.cacheDir)
+        RandomAccessFile(tempFile, "rw").use { raf ->
+            raf.setLength(totalBytes)
+        }
+
+        val downloadedBytes = AtomicLong(0L)
+        val lastProgress = AtomicInteger(-1)
+
+        runCatching {
+            (0 until segmentCount).map { index ->
+                async(Dispatchers.IO) {
+                    val start = index * segmentSize
+                    if (start >= totalBytes) return@async
+                    val end = minOf(totalBytes - 1, start + segmentSize - 1)
+                    downloadRangeSegment(
+                        finalUrl = finalUrl,
+                        start = start,
+                        end = end,
+                        tempFile = tempFile,
+                        downloadedBytes = downloadedBytes,
+                        totalBytes = totalBytes,
+                        lastProgress = lastProgress,
+                        onProgress = onProgress
+                    )
+                }
+            }.awaitAll()
+        }.getOrElse { error ->
+            runCatching { tempFile.delete() }
+            throw error
+        }
+
+        tempFile
+    }
+
+    private suspend fun downloadRangeSegment(
+        finalUrl: String,
+        start: Long,
+        end: Long,
+        tempFile: File,
+        downloadedBytes: AtomicLong,
+        totalBytes: Long,
+        lastProgress: AtomicInteger,
+        onProgress: suspend (Int) -> Unit
+    ) {
+        val expectedBytes = end - start + 1
+        if (expectedBytes <= 0L) return
+
+        val connection = openRangeConnection(finalUrl = finalUrl, start = start, end = end)
+        try {
+            val code = connection.responseCode
+            if (code != 206) {
+                throw IllegalStateException("分片下载失败：HTTP $code（Range $start-$end）")
+            }
+
+            var segmentWritten = 0L
+            RandomAccessFile(tempFile, "rw").use { raf ->
+                raf.seek(start)
+                connection.inputStream.use { input ->
+                    val buffer = ByteArray(BUFFER_SIZE)
+                    while (segmentWritten < expectedBytes) {
+                        val maxRead = minOf(buffer.size.toLong(), expectedBytes - segmentWritten).toInt()
+                        val read = input.read(buffer, 0, maxRead)
+                        if (read <= 0) break
+                        raf.write(buffer, 0, read)
+                        segmentWritten += read
+                        val merged = downloadedBytes.addAndGet(read.toLong())
+                        reportParallelProgress(
+                            downloadedBytes = merged,
+                            totalBytes = totalBytes,
+                            lastProgress = lastProgress,
+                            onProgress = onProgress
+                        )
+                    }
+                }
+            }
+
+            if (segmentWritten != expectedBytes) {
+                throw IllegalStateException(
+                    "分片下载不完整：Range $start-$end，期望 $expectedBytes 字节，实际 $segmentWritten 字节"
+                )
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private suspend fun reportParallelProgress(
+        downloadedBytes: Long,
+        totalBytes: Long,
+        lastProgress: AtomicInteger,
+        onProgress: suspend (Int) -> Unit
+    ) {
+        if (totalBytes <= 0L) return
+        val progress = ((downloadedBytes * 100) / totalBytes).toInt().coerceIn(0, 100)
+        while (true) {
+            val previous = lastProgress.get()
+            if (progress <= previous) return
+            if (lastProgress.compareAndSet(previous, progress)) {
+                onProgress(progress)
+                return
+            }
+        }
+    }
+
+    private suspend fun openRangeConnection(finalUrl: String, start: Long, end: Long): HttpURLConnection {
+        val url = URL(finalUrl)
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            instanceFollowRedirects = true
+            requestMethod = "GET"
+            connectTimeout = 30_000
+            readTimeout = 90_000
+            setRequestProperty("User-Agent", ANDROID_CHROME_UA)
+            setRequestProperty("Accept", "*/*")
+            setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+            setRequestProperty("Accept-Encoding", "identity")
+            setRequestProperty("Range", "bytes=$start-$end")
+            applySourceSpecificRequestHeaders(this, url)
+        }
+        val cookieHeader = buildCookieHeader(url)
+        if (cookieHeader.isNotBlank()) {
+            connection.setRequestProperty("Cookie", cookieHeader)
+        }
+        return connection
+    }
+
+    private fun writeTempFileToTargetUri(context: Context, targetUri: Uri, tempFile: File): Long {
+        var bytesWritten = 0L
+        context.contentResolver.openOutputStream(targetUri, "w")?.use { output ->
+            tempFile.inputStream().use { input ->
+                val buffer = ByteArray(BUFFER_SIZE)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    output.write(buffer, 0, read)
+                    bytesWritten += read
+                }
+                output.flush()
+            }
+        } ?: throw IllegalStateException("无法写入目标文件")
+        return bytesWritten
+    }
+
+    private fun computeParallelSegmentCount(totalBytes: Long): Int {
+        val bySize = (totalBytes / PARALLEL_DOWNLOAD_TARGET_SEGMENT_BYTES).toInt()
+            .coerceAtLeast(PARALLEL_DOWNLOAD_MIN_SEGMENTS)
+        return bySize.coerceAtMost(PARALLEL_DOWNLOAD_MAX_SEGMENTS)
     }
 
     private suspend fun resolveRetrySourceUrlForHtmlResponse(
@@ -471,6 +817,7 @@ class VideoDownloadRepository(
             isInstagramPageUrl(url) -> resolveInstagramSourceUrl(source, url)
             isTikTokPageUrl(url) -> resolveTikTokSourceUrl(source)
             isDouyinPageUrl(url) -> resolveDouyinSourceUrl(source)
+            isBilibiliPageUrl(url) -> resolveBilibiliSourceUrl(source)
             isXiaohongshuPageUrl(url) -> resolveXiaohongshuSourceUrl(source)
             isYouTubePageUrl(url) -> resolveYouTubeSourceUrl(source)
             isXPageUrl(url) -> resolveXSourceUrl(source)
@@ -535,9 +882,18 @@ class VideoDownloadRepository(
         discoveredItemId?.let { candidates += "https://m.douyin.com/share/video/$it" }
 
         candidates.forEach { pageUrl ->
+            Log.i(LOG_TAG, "douyin resolve fetch page=$pageUrl")
             val page = fetchDouyinPage(pageUrl)
+            Log.i(LOG_TAG, "douyin resolve fetched page bytes=${page.length} from=$pageUrl")
+            if (isLikelyDouyinAudioOnlyPage(page)) {
+                Log.i(LOG_TAG, "douyin resolve detected note/audio-only page=$pageUrl")
+                throw IllegalStateException(
+                    "下载失败：该抖音链接是图文/音频内容（非视频），当前仅支持视频下载。"
+                )
+            }
             val resolved = extractDouyinVideoUrlFromPage(page)
             if (!resolved.isNullOrBlank()) {
+                Log.i(LOG_TAG, "douyin resolve parsed direct=$resolved from=$pageUrl")
                 return resolved
             }
             if (discoveredItemId.isNullOrBlank()) {
@@ -547,9 +903,12 @@ class VideoDownloadRepository(
 
         discoveredItemId?.let { itemId ->
             val apiUrl = "https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids=$itemId"
+            Log.i(LOG_TAG, "douyin resolve fetch api=$apiUrl")
             val apiBody = fetchDouyinApi(apiUrl)
+            Log.i(LOG_TAG, "douyin resolve fetched api bytes=${apiBody.length} itemId=$itemId")
             val resolvedFromApi = extractDouyinVideoUrlFromPage(apiBody)
             if (!resolvedFromApi.isNullOrBlank()) {
+                Log.i(LOG_TAG, "douyin resolve parsed api direct=$resolvedFromApi itemId=$itemId")
                 return resolvedFromApi
             }
         }
@@ -579,22 +938,94 @@ class VideoDownloadRepository(
         )
     }
 
-    private suspend fun resolveYouTubeSourceUrl(source: String): String {
-        val videoId = extractYouTubeVideoId(source)
-        if (!videoId.isNullOrBlank()) {
-            resolveYouTubeViaInnertube(source = source, videoId = videoId)?.let { return it }
+    private suspend fun resolveBilibiliSourceUrl(source: String): String {
+        val sourceCandidates = linkedSetOf(source)
+        val redirected = runCatching {
+            resolveFinalRedirectUrl(
+                pageUrl = source,
+                userAgent = DESKTOP_CHROME_UA,
+                referer = "https://www.bilibili.com/"
+            )
+        }.getOrNull()
+        if (!redirected.isNullOrBlank()) {
+            sourceCandidates += sanitizeHttpUrl(redirected)
+            if (isLikelyBilibiliVideoUrl(redirected)) {
+                return sanitizeHttpUrl(redirected)
+            }
         }
 
-        val candidates = linkedSetOf(source)
+        sourceCandidates.forEach { candidate ->
+            resolveBilibiliViaWebApi(candidate)?.let { return it }
+        }
+
+        sourceCandidates.forEach { pageUrl ->
+            val page = fetchBilibiliPage(pageUrl)
+            val resolved = extractBilibiliVideoUrlFromPage(page)
+            if (!resolved.isNullOrBlank()) {
+                return resolved
+            }
+
+            val inferredBvid = extractBilibiliBvid(page)
+            val inferredAid = extractBilibiliAid(page)
+            val p = extractBilibiliPageNumber(pageUrl) ?: 1
+
+            val canonical = when {
+                !inferredBvid.isNullOrBlank() -> "https://www.bilibili.com/video/$inferredBvid/?p=$p"
+                inferredAid != null -> "https://www.bilibili.com/video/av$inferredAid/?p=$p"
+                else -> null
+            } ?: return@forEach
+
+            resolveBilibiliViaWebApi(canonical)?.let { return it }
+
+            val canonicalPage = fetchBilibiliPage(canonical)
+            val resolvedFromCanonical = extractBilibiliVideoUrlFromPage(canonicalPage)
+            if (!resolvedFromCanonical.isNullOrBlank()) {
+                return resolvedFromCanonical
+            }
+        }
+
+        throw IllegalStateException(
+            "下载失败：bilibili 页面未解析到视频直链。请确认链接可公开访问，或导入可用的 bilibili Cookies 后重试。"
+        )
+    }
+
+    private suspend fun resolveYouTubeSourceUrl(source: String): String {
+        val videoId = extractYouTubeVideoId(source)
+        val canonicalWatchUrl = videoId?.let { "https://www.youtube.com/watch?v=$it" }
+        if (!videoId.isNullOrBlank()) {
+            runCatching {
+                resolveYouTubeViaInnertube(source = canonicalWatchUrl ?: source, videoId = videoId)
+            }.onFailure { error ->
+                safeLogInfo("youtube innertube primary failed source=$source message=${error.message}")
+            }.getOrNull()?.let { return it }
+
+            if (!canonicalWatchUrl.isNullOrBlank() && canonicalWatchUrl != source) {
+                runCatching {
+                    resolveYouTubeViaInnertube(source = source, videoId = videoId)
+                }.onFailure { error ->
+                    safeLogInfo("youtube innertube fallback(shorts) failed source=$source message=${error.message}")
+                }.getOrNull()?.let { return it }
+            }
+        }
+
+        val candidates = linkedSetOf<String>()
+        if (!canonicalWatchUrl.isNullOrBlank()) {
+            candidates += canonicalWatchUrl
+        }
+        candidates += source
         videoId?.let {
-            candidates += "https://www.youtube.com/watch?v=$it"
             candidates += "https://www.youtube.com/shorts/$it"
             candidates += "https://m.youtube.com/watch?v=$it"
         }
 
         var fallbackCandidate: String? = null
         candidates.forEach { pageUrl ->
-            val page = fetchYouTubePage(pageUrl)
+            val page = runCatching { fetchYouTubePage(pageUrl) }
+                .onFailure { error ->
+                    safeLogInfo("youtube fetch page failed page=$pageUrl message=${error.message}")
+                }
+                .getOrNull()
+                ?: return@forEach
             val pageCandidates = extractYouTubeVideoCandidatesFromPage(page)
             selectReachableYouTubeCandidate(pageCandidates)?.let { return it }
             if (fallbackCandidate.isNullOrBlank()) {
@@ -603,7 +1034,14 @@ class VideoDownloadRepository(
         }
 
         if (!videoId.isNullOrBlank()) {
-            resolveYouTubeViaInnertube(source = "https://www.youtube.com/watch?v=$videoId", videoId = videoId)?.let { return it }
+            runCatching {
+                resolveYouTubeViaInnertube(
+                    source = canonicalWatchUrl ?: "https://www.youtube.com/watch?v=$videoId",
+                    videoId = videoId
+                )
+            }.onFailure { error ->
+                safeLogInfo("youtube innertube final retry failed source=$source message=${error.message}")
+            }.getOrNull()?.let { return it }
         }
 
         fallbackCandidate?.let { return it }
@@ -656,6 +1094,18 @@ class VideoDownloadRepository(
             host.endsWith(".iesdouyin.com")
         if (!isDouyinHost) return false
         return !url.path.lowercase().endsWith(".mp4")
+    }
+
+    private fun isBilibiliPageUrl(url: URL): Boolean {
+        val host = url.host.lowercase()
+        if (host.contains("bilivideo") || host.contains("hdslb")) return false
+        val isBilibiliHost = host == "b23.tv" ||
+            host.endsWith(".b23.tv") ||
+            host == "bilibili.com" ||
+            host.endsWith(".bilibili.com")
+        if (!isBilibiliHost) return false
+        val path = url.path.lowercase()
+        return !(path.endsWith(".mp4") || path.endsWith(".m4s") || path.endsWith(".flv"))
     }
 
     private fun isXiaohongshuPageUrl(url: URL): Boolean {
@@ -753,6 +1203,23 @@ class VideoDownloadRepository(
         )
     }
 
+    private suspend fun fetchBilibiliPage(pageUrl: String): String {
+        return fetchWebPage(
+            pageUrl = pageUrl,
+            userAgent = DESKTOP_CHROME_UA,
+            referer = "https://www.bilibili.com/"
+        )
+    }
+
+    private suspend fun fetchBilibiliApi(pageUrl: String): String {
+        return fetchWebPage(
+            pageUrl = pageUrl,
+            userAgent = DESKTOP_CHROME_UA,
+            referer = "https://www.bilibili.com/",
+            accept = "application/json,text/plain,*/*"
+        )
+    }
+
     private suspend fun fetchYouTubePage(pageUrl: String): String {
         return fetchWebPage(
             pageUrl = pageUrl,
@@ -833,6 +1300,135 @@ class VideoDownloadRepository(
         return fallbackCandidate
     }
 
+    private suspend fun resolveBilibiliViaWebApi(source: String): String? {
+        val bvid = extractBilibiliBvid(source)
+        val aid = extractBilibiliAid(source)
+        if (bvid.isNullOrBlank() && aid == null) return null
+
+        val targetPage = extractBilibiliPageNumber(source) ?: 1
+        val viewApiUrl = when {
+            !bvid.isNullOrBlank() -> "https://api.bilibili.com/x/web-interface/view?bvid=$bvid"
+            else -> "https://api.bilibili.com/x/web-interface/view?aid=$aid"
+        }
+        val viewBody = fetchBilibiliApi(viewApiUrl)
+        if (!isBilibiliApiSuccess(viewBody)) {
+            safeLogInfo("bilibili view api failed source=$source")
+            return null
+        }
+
+        val cidCandidates = extractBilibiliCidCandidatesFromViewApi(viewBody, targetPage)
+        if (cidCandidates.isEmpty()) {
+            safeLogInfo("bilibili view api cid missing source=$source targetPage=$targetPage")
+            return null
+        }
+
+        cidCandidates.forEach { cid ->
+            val playApiUrl = buildString {
+                append("https://api.bilibili.com/x/player/playurl?")
+                if (!bvid.isNullOrBlank()) {
+                    append("bvid=").append(bvid)
+                } else {
+                    append("aid=").append(aid)
+                }
+                append("&cid=").append(cid)
+                append("&qn=80&fnval=0&fnver=0&fourk=1&platform=html5")
+            }
+            val playBody = fetchBilibiliApi(playApiUrl)
+            if (!isBilibiliApiSuccess(playBody)) {
+                return@forEach
+            }
+            val resolved = extractBilibiliVideoUrlFromApi(playBody)
+            if (!resolved.isNullOrBlank()) {
+                return resolved
+            }
+        }
+
+        safeLogInfo(
+            "bilibili playurl api unresolved source=$source targetPage=$targetPage candidates=${cidCandidates.size}"
+        )
+        return null
+    }
+
+    private fun isBilibiliApiSuccess(content: String): Boolean {
+        val code = Regex("""["']code["']\s*:\s*(-?\d+)""", RegexOption.IGNORE_CASE)
+            .find(content)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+        return code == 0
+    }
+
+    private fun extractBilibiliCidCandidatesFromViewApi(content: String, preferredPage: Int): List<String> {
+        val normalized = normalizeEscapedContent(content)
+        val pageToCid = linkedMapOf<Int, LinkedHashSet<String>>()
+
+        fun addCid(page: Int, cid: String) {
+            if (page <= 0 || cid.isBlank()) return
+            val set = pageToCid.getOrPut(page) { linkedSetOf() }
+            set += cid
+        }
+
+        val pagesBlock = Regex("""(?is)["']pages["']\s*:\s*\[(.*?)]""")
+            .find(normalized)
+            ?.groupValues
+            ?.getOrNull(1)
+            .orEmpty()
+
+        if (pagesBlock.isNotBlank()) {
+            Regex("""(?is)\{[^{}]*["']page["']\s*:\s*(\d+)[^{}]*["']cid["']\s*:\s*(\d{5,20})""")
+                .findAll(pagesBlock)
+                .forEach { match ->
+                    val page = match.groupValues.getOrNull(1)?.toIntOrNull() ?: return@forEach
+                    val cid = match.groupValues.getOrNull(2).orEmpty()
+                    addCid(page, cid)
+                }
+
+            Regex("""(?is)\{[^{}]*["']cid["']\s*:\s*(\d{5,20})[^{}]*["']page["']\s*:\s*(\d+)""")
+                .findAll(pagesBlock)
+                .forEach { match ->
+                    val cid = match.groupValues.getOrNull(1).orEmpty()
+                    val page = match.groupValues.getOrNull(2)?.toIntOrNull() ?: return@forEach
+                    addCid(page, cid)
+                }
+        }
+
+        Regex("""(?is)\{[^{}]*["']page["']\s*:\s*(\d+)[^{}]*["']cid["']\s*:\s*(\d{5,20})""")
+            .findAll(normalized)
+            .forEach { match ->
+                val page = match.groupValues.getOrNull(1)?.toIntOrNull() ?: return@forEach
+                val cid = match.groupValues.getOrNull(2).orEmpty()
+                addCid(page, cid)
+            }
+
+        Regex("""(?is)\{[^{}]*["']cid["']\s*:\s*(\d{5,20})[^{}]*["']page["']\s*:\s*(\d+)""")
+            .findAll(normalized)
+            .forEach { match ->
+                val cid = match.groupValues.getOrNull(1).orEmpty()
+                val page = match.groupValues.getOrNull(2)?.toIntOrNull() ?: return@forEach
+                addCid(page, cid)
+            }
+
+        val ordered = linkedSetOf<String>()
+        if (pageToCid.isNotEmpty()) {
+            pageToCid[preferredPage]?.forEach { ordered += it }
+            pageToCid.toSortedMap().forEach { (page, cids) ->
+                if (page == preferredPage) return@forEach
+                cids.forEach { ordered += it }
+            }
+        }
+
+        if (ordered.isNotEmpty()) {
+            return ordered.toList()
+        }
+
+        return Regex("""["']cid["']\s*:\s*(\d{5,20})""", RegexOption.IGNORE_CASE)
+            .find(normalized)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.let { listOf(it) }
+            ?: emptyList()
+    }
+
     private fun extractTikwmVideoUrlFromApiResponse(content: String): String? {
         val code = Regex(""""code"\s*:\s*(-?\d+)""", RegexOption.IGNORE_CASE)
             .find(content)
@@ -854,7 +1450,7 @@ class VideoDownloadRepository(
         }
 
         if (candidates.isEmpty()) return null
-        return candidates.maxByOrNull(::videoQualityScore)
+        return bestTikTokCandidate(candidates)
     }
 
     private fun extractYouTubeInnertubeApiKey(content: String): String? {
@@ -1148,6 +1744,10 @@ class VideoDownloadRepository(
         return "$url$separator$key=$encodedValue"
     }
 
+    private fun safeLogInfo(message: String) {
+        runCatching { Log.i(LOG_TAG, message) }
+    }
+
     private suspend fun fetchWebPage(
         pageUrl: String,
         userAgent: String,
@@ -1268,68 +1868,176 @@ class VideoDownloadRepository(
             host.contains("xiaohongshu") || host.contains("xhscdn") || host.contains("xhslink") -> {
                 connection.setRequestProperty("Referer", "https://www.xiaohongshu.com/")
             }
+
+            host.contains("bilibili") || host.contains("b23.tv") || host.contains("bilivideo") || host.contains("hdslb") -> {
+                connection.setRequestProperty("Referer", "https://www.bilibili.com/")
+            }
         }
     }
 
     private fun extractInstagramVideoUrlFromPage(html: String): String? {
-        extractFirstValidVideoUrl(html, INSTAGRAM_OG_VIDEO_PATTERNS)?.let { return it }
-        extractFirstValidVideoUrl(html, INSTAGRAM_VIDEO_URL_PATTERNS)?.let { return it }
+        val candidates = linkedSetOf<String>()
+        candidates += extractAllValidVideoUrls(html, INSTAGRAM_OG_VIDEO_PATTERNS, ::isLikelyInstagramVideoUrl)
+        candidates += extractAllValidVideoUrls(html, INSTAGRAM_VIDEO_URL_PATTERNS, ::isLikelyInstagramVideoUrl)
 
         val normalizedHtml = normalizeEscapedContent(html)
         if (normalizedHtml != html) {
-            extractFirstValidVideoUrl(normalizedHtml, INSTAGRAM_OG_VIDEO_PATTERNS)?.let { return it }
-            extractFirstValidVideoUrl(normalizedHtml, INSTAGRAM_VIDEO_URL_PATTERNS)?.let { return it }
+            candidates += extractAllValidVideoUrls(normalizedHtml, INSTAGRAM_OG_VIDEO_PATTERNS, ::isLikelyInstagramVideoUrl)
+            candidates += extractAllValidVideoUrls(normalizedHtml, INSTAGRAM_VIDEO_URL_PATTERNS, ::isLikelyInstagramVideoUrl)
         }
 
-        extractFirstVideoUrlFromUrlListBlocks(normalizedHtml, ::isLikelyInstagramVideoUrl)?.let { return it }
-        extractFirstMatchingHttpUrl(normalizedHtml, ::isLikelyInstagramVideoUrl)?.let { return it }
-
-        return null
+        extractFirstVideoUrlFromUrlListBlocks(normalizedHtml, ::isLikelyInstagramVideoUrl)?.let { candidates += it }
+        candidates += extractAllMatchingHttpUrls(normalizedHtml, ::isLikelyInstagramVideoUrl)
+        return bestInstagramCandidate(candidates)
     }
 
     private fun extractTikTokVideoUrlFromPage(html: String): String? {
-        extractFirstValidVideoUrl(html, INSTAGRAM_OG_VIDEO_PATTERNS)?.let { return it }
-        extractFirstValidVideoUrl(html, TIKTOK_VIDEO_URL_PATTERNS)?.let { return it }
+        val candidates = linkedSetOf<String>()
+        candidates += extractAllValidVideoUrls(html, INSTAGRAM_OG_VIDEO_PATTERNS, ::isLikelyTikTokVideoUrl)
+        candidates += extractAllValidVideoUrls(html, TIKTOK_VIDEO_URL_PATTERNS, ::isLikelyTikTokVideoUrl)
 
         val normalized = normalizeEscapedContent(html)
         if (normalized != html) {
-            extractFirstValidVideoUrl(normalized, INSTAGRAM_OG_VIDEO_PATTERNS)?.let { return it }
-            extractFirstValidVideoUrl(normalized, TIKTOK_VIDEO_URL_PATTERNS)?.let { return it }
+            candidates += extractAllValidVideoUrls(normalized, INSTAGRAM_OG_VIDEO_PATTERNS, ::isLikelyTikTokVideoUrl)
+            candidates += extractAllValidVideoUrls(normalized, TIKTOK_VIDEO_URL_PATTERNS, ::isLikelyTikTokVideoUrl)
         }
 
-        extractFirstVideoUrlFromUrlListBlocks(normalized, ::isLikelyTikTokVideoUrl)?.let { return it }
-        extractFirstMatchingHttpUrl(normalized, ::isLikelyTikTokVideoUrl)?.let { return it }
-        return null
+        extractFirstVideoUrlFromUrlListBlocks(normalized, ::isLikelyTikTokVideoUrl)?.let { candidates += it }
+        candidates += extractAllMatchingHttpUrls(normalized, ::isLikelyTikTokVideoUrl)
+        return bestTikTokCandidate(candidates)
     }
 
     private fun extractDouyinVideoUrlFromPage(content: String): String? {
-        extractFirstValidVideoUrl(content, INSTAGRAM_OG_VIDEO_PATTERNS, ::isLikelyDouyinVideoUrl)?.let { return it }
-        extractFirstValidVideoUrl(content, DOUYIN_VIDEO_URL_PATTERNS, ::isLikelyDouyinVideoUrl)?.let { return it }
+        val candidates = linkedSetOf<String>()
+        candidates += extractAllValidVideoUrls(content, INSTAGRAM_OG_VIDEO_PATTERNS, ::isLikelyDouyinVideoUrl)
+        candidates += extractAllValidVideoUrls(content, DOUYIN_VIDEO_URL_PATTERNS, ::isLikelyDouyinVideoUrl)
 
         val normalized = normalizeEscapedContent(content)
         if (normalized != content) {
-            extractFirstValidVideoUrl(normalized, INSTAGRAM_OG_VIDEO_PATTERNS, ::isLikelyDouyinVideoUrl)?.let { return it }
-            extractFirstValidVideoUrl(normalized, DOUYIN_VIDEO_URL_PATTERNS, ::isLikelyDouyinVideoUrl)?.let { return it }
+            candidates += extractAllValidVideoUrls(normalized, INSTAGRAM_OG_VIDEO_PATTERNS, ::isLikelyDouyinVideoUrl)
+            candidates += extractAllValidVideoUrls(normalized, DOUYIN_VIDEO_URL_PATTERNS, ::isLikelyDouyinVideoUrl)
         }
 
-        extractFirstVideoUrlFromUrlListBlocks(normalized, ::isLikelyDouyinVideoUrl)?.let { return it }
-        extractFirstMatchingHttpUrl(normalized, ::isLikelyDouyinVideoUrl)?.let { return it }
-        return null
+        extractFirstVideoUrlFromUrlListBlocks(normalized, ::isLikelyDouyinVideoUrl)?.let { candidates += it }
+        candidates += extractAllMatchingHttpUrls(normalized, ::isLikelyDouyinVideoUrl)
+        return bestDouyinCandidate(candidates)
+    }
+
+    private fun isLikelyDouyinAudioOnlyPage(content: String): Boolean {
+        val normalized = content
+            .replace("\\\\/", "/")
+            .replace("\\/", "/")
+        val lower = normalized.lowercase()
+
+        val hasAwemeType2 = Regex(
+            """\\?["']aweme_?type\\?["']\s*[:=]\s*["']?2["']?\b""",
+            RegexOption.IGNORE_CASE
+        ).containsMatchIn(normalized)
+        val hasNoteMarker = lower.contains("douyin.com/note/") ||
+            lower.contains("/note/") ||
+            Regex(
+                """["'](?:detail_?type|item_?type)["']\s*[:=]\s*["']note["']""",
+                RegexOption.IGNORE_CASE
+            ).containsMatchIn(normalized)
+        val hasAudioMarker = lower.contains("<audio") ||
+            lower.contains(".mp3") ||
+            lower.contains("ies-music") ||
+            lower.contains("mime=audio") ||
+            lower.contains("mime_type=audio") ||
+            lower.contains("audio_mp4")
+        if (hasAwemeType2 && hasAudioMarker) return true
+        if (hasNoteMarker && hasAudioMarker) return true
+        return false
     }
 
     private fun extractXiaohongshuVideoUrlFromPage(content: String): String? {
-        extractFirstValidVideoUrl(content, INSTAGRAM_OG_VIDEO_PATTERNS)?.let { return it }
-        extractFirstValidVideoUrl(content, XIAOHONGSHU_VIDEO_URL_PATTERNS)?.let { return it }
+        val candidates = linkedSetOf<String>()
+        candidates += extractAllValidVideoUrls(content, INSTAGRAM_OG_VIDEO_PATTERNS, ::isLikelyXiaohongshuVideoUrl)
+        candidates += extractAllValidVideoUrls(content, XIAOHONGSHU_VIDEO_URL_PATTERNS, ::isLikelyXiaohongshuVideoUrl)
 
         val normalized = normalizeEscapedContent(content)
         if (normalized != content) {
-            extractFirstValidVideoUrl(normalized, INSTAGRAM_OG_VIDEO_PATTERNS)?.let { return it }
-            extractFirstValidVideoUrl(normalized, XIAOHONGSHU_VIDEO_URL_PATTERNS)?.let { return it }
+            candidates += extractAllValidVideoUrls(normalized, INSTAGRAM_OG_VIDEO_PATTERNS, ::isLikelyXiaohongshuVideoUrl)
+            candidates += extractAllValidVideoUrls(normalized, XIAOHONGSHU_VIDEO_URL_PATTERNS, ::isLikelyXiaohongshuVideoUrl)
         }
 
-        extractFirstVideoUrlFromUrlListBlocks(normalized, ::isLikelyXiaohongshuVideoUrl)?.let { return it }
-        extractFirstMatchingHttpUrl(normalized, ::isLikelyXiaohongshuVideoUrl)?.let { return it }
-        return null
+        extractFirstVideoUrlFromUrlListBlocks(normalized, ::isLikelyXiaohongshuVideoUrl)?.let { candidates += it }
+        candidates += extractAllMatchingHttpUrls(normalized, ::isLikelyXiaohongshuVideoUrl)
+        return bestXiaohongshuCandidate(candidates)
+    }
+
+    private fun extractBilibiliVideoUrlFromPage(content: String): String? {
+        val normalized = normalizeEscapedContent(content)
+        val durlCandidates = extractBilibiliDurlCandidates(normalized)
+        if (durlCandidates.isNotEmpty()) {
+            return bestBilibiliMuxedCandidate(durlCandidates)
+        }
+
+        val candidates = linkedSetOf<String>()
+        candidates += extractBilibiliDashVideoCandidates(normalized)
+        candidates += extractAllValidVideoUrls(normalized, INSTAGRAM_OG_VIDEO_PATTERNS, ::isLikelyBilibiliVideoUrl)
+        candidates += extractAllValidVideoUrls(normalized, BILIBILI_VIDEO_URL_PATTERNS, ::isLikelyBilibiliVideoUrl)
+        candidates += extractAllMatchingHttpUrls(normalized, ::isLikelyBilibiliVideoUrl)
+        candidates += extractProtocolRelativeBilibiliVideoUrls(normalized)
+        return bestBilibiliCandidate(candidates)
+    }
+
+    private fun extractBilibiliVideoUrlFromApi(content: String): String? {
+        val normalized = normalizeEscapedContent(content)
+        val durlCandidates = extractBilibiliDurlCandidates(normalized)
+        if (durlCandidates.isNotEmpty()) {
+            return bestBilibiliMuxedCandidate(durlCandidates)
+        }
+        val dashCandidates = extractBilibiliDashVideoCandidates(normalized)
+        return bestBilibiliCandidate(dashCandidates)
+    }
+
+    private fun extractBilibiliDurlCandidates(content: String): List<String> {
+        val normalized = normalizeEscapedContent(content)
+        val candidates = linkedSetOf<String>()
+        Regex("""(?is)"durl"\s*:\s*\[(.*?)]""")
+            .findAll(normalized)
+            .forEach { match ->
+                val block = match.groupValues.getOrNull(1).orEmpty()
+                candidates += extractAllMatchingHttpUrls(block, ::isLikelyBilibiliVideoUrl)
+                candidates += extractProtocolRelativeBilibiliVideoUrls(block)
+            }
+        return candidates.toList()
+    }
+
+    private fun extractBilibiliDashVideoCandidates(content: String): List<String> {
+        val normalized = normalizeEscapedContent(content)
+        val candidates = linkedSetOf<String>()
+        Regex("""(?is)"video"\s*:\s*\[(.*?)]\s*(?:,\s*"audio"|\})""")
+            .findAll(normalized)
+            .forEach { match ->
+                val block = match.groupValues.getOrNull(1).orEmpty()
+                candidates += extractAllValidVideoUrls(block, BILIBILI_VIDEO_URL_PATTERNS, ::isLikelyBilibiliVideoUrl)
+                candidates += extractAllMatchingHttpUrls(block, ::isLikelyBilibiliVideoUrl)
+                candidates += extractProtocolRelativeBilibiliVideoUrls(block)
+            }
+
+        if (candidates.isEmpty()) {
+            candidates += extractAllValidVideoUrls(normalized, BILIBILI_VIDEO_URL_PATTERNS, ::isLikelyBilibiliVideoUrl)
+            candidates += extractAllMatchingHttpUrls(normalized, ::isLikelyBilibiliVideoUrl)
+            candidates += extractProtocolRelativeBilibiliVideoUrls(normalized)
+        }
+
+        return candidates.toList()
+    }
+
+    private fun extractProtocolRelativeBilibiliVideoUrls(content: String): List<String> {
+        val normalized = normalizeEscapedContent(content)
+        val candidates = linkedSetOf<String>()
+        Regex("""//[^"'<>\s\\]*(?:bilivideo|hdslb)[^"'<>\s\\]*""", RegexOption.IGNORE_CASE)
+            .findAll(normalized)
+            .forEach { match ->
+                val candidate = sanitizeHttpUrl("https:${decodeEscapedUrl(match.value)}")
+                if (isLikelyBilibiliVideoUrl(candidate)) {
+                    candidates += candidate
+                }
+            }
+        return candidates.toList()
     }
 
     private fun extractYouTubeVideoUrlFromPage(content: String): String? {
@@ -1483,9 +2191,33 @@ class VideoDownloadRepository(
         return candidates.toList()
     }
 
+    private fun isLikelyAudioOnlyUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        if (lower.contains(".mp3") || lower.contains(".m4a") || lower.contains(".aac") || lower.contains(".wav")) {
+            return true
+        }
+        if (lower.contains("mime=audio") || lower.contains("mime_type=audio") || lower.contains("audio_mp4")) {
+            return true
+        }
+        if (lower.contains("ies-music") || lower.contains("/music/")) {
+            return true
+        }
+        return false
+    }
+
     private fun isLikelyTikTokVideoUrl(url: String): Boolean {
         val lower = url.lowercase()
         if (!(lower.startsWith("http://") || lower.startsWith("https://"))) return false
+        if (isLikelyAudioOnlyUrl(url)) return false
+        if (
+            lower.contains(".js") ||
+            lower.contains(".css") ||
+            lower.contains(".html") ||
+            lower.contains(".json") ||
+            lower.contains("/static/js/")
+        ) {
+            return false
+        }
         if (lower.contains("mime=audio") || lower.contains("mime_type=audio") || lower.contains("audio_mp4")) {
             return false
         }
@@ -1493,7 +2225,11 @@ class VideoDownloadRepository(
         if (lower.contains("/aweme/v1/play/")) return true
         val host = runCatching { URL(url).host.lowercase() }.getOrNull() ?: return false
         if (host.contains("tiktokcdn") || host.contains("tiktokv") || host.contains("muscdn")) {
-            return lower.contains("video") || lower.contains("play") || lower.contains("download")
+            return lower.contains("/video/") ||
+                lower.contains("/aweme/") ||
+                lower.contains("/tos/") ||
+                lower.contains("mime_type=video") ||
+                lower.contains("mime=video")
         }
         return false
     }
@@ -1501,6 +2237,7 @@ class VideoDownloadRepository(
     private fun isLikelyDouyinVideoUrl(url: String): Boolean {
         val lower = url.lowercase()
         if (!(lower.startsWith("http://") || lower.startsWith("https://"))) return false
+        if (isLikelyAudioOnlyUrl(url)) return false
         if (lower.contains("/share/video/")) return false
         if (lower.contains("/aweme/v1/play/") || lower.contains("playwm")) return true
         if (lower.contains(".mp4") && (lower.contains("douyin") || lower.contains("aweme") || lower.contains("vod"))) {
@@ -1514,6 +2251,264 @@ class VideoDownloadRepository(
             return lower.contains("video") || lower.contains("play") || lower.contains("vod")
         }
         return false
+    }
+
+    private fun bestTikTokCandidate(candidates: Collection<String>): String? {
+        val normalized = normalizeTikTokCandidates(candidates)
+        if (normalized.isEmpty()) return null
+        return normalized.minWithOrNull(
+            compareBy<String> { tikTokWatermarkPenalty(it) }
+                .thenByDescending { videoQualityScore(it) }
+        )
+    }
+
+    private fun normalizeTikTokCandidates(candidates: Collection<String>): List<String> {
+        val normalized = linkedSetOf<String>()
+        candidates.forEach { raw ->
+            val candidate = sanitizeHttpUrl(raw)
+            if (!isLikelyTikTokVideoUrl(candidate)) return@forEach
+            normalized += candidate
+
+            if (candidate.contains("playwm", ignoreCase = true)) {
+                normalized += sanitizeHttpUrl(
+                    candidate.replace("playwm", "play", ignoreCase = true)
+                )
+            }
+            if (candidate.contains("wmplay", ignoreCase = true)) {
+                normalized += sanitizeHttpUrl(
+                    candidate.replace("wmplay", "play", ignoreCase = true)
+                )
+                normalized += sanitizeHttpUrl(
+                    candidate.replace("wmplay", "hdplay", ignoreCase = true)
+                )
+            }
+            if (candidate.contains("watermark=1", ignoreCase = true)) {
+                normalized += sanitizeHttpUrl(
+                    candidate.replace("watermark=1", "watermark=0", ignoreCase = true)
+                )
+            }
+            if (candidate.contains("watermark%3d1", ignoreCase = true)) {
+                normalized += sanitizeHttpUrl(
+                    candidate.replace("watermark%3d1", "watermark%3d0", ignoreCase = true)
+                )
+            }
+            if (candidate.contains("is_watermark=1", ignoreCase = true)) {
+                normalized += sanitizeHttpUrl(
+                    candidate.replace("is_watermark=1", "is_watermark=0", ignoreCase = true)
+                )
+            }
+        }
+        return normalized.filter(::isLikelyTikTokVideoUrl)
+    }
+
+    private fun tikTokWatermarkPenalty(url: String): Int {
+        val lower = url.lowercase()
+        var penalty = commonWatermarkPenalty(url)
+        if (lower.contains("playwm") || lower.contains("wmplay")) {
+            penalty += 2
+        }
+        return penalty
+    }
+
+    private fun bestDouyinCandidate(candidates: Collection<String>): String? {
+        val normalized = normalizeDouyinCandidates(candidates)
+        if (normalized.isEmpty()) return null
+        return normalized.minWithOrNull(
+            compareBy<String> { douyinWatermarkPenalty(it) }
+                .thenByDescending { videoQualityScore(it) }
+        )
+    }
+
+    private fun normalizeDouyinCandidates(candidates: Collection<String>): List<String> {
+        val normalized = linkedSetOf<String>()
+        candidates.forEach { raw ->
+            val candidate = sanitizeHttpUrl(raw)
+            if (!isLikelyDouyinVideoUrl(candidate)) return@forEach
+            val baseCandidates = linkedSetOf(candidate)
+
+            // 常见无水印变体：playwm -> play
+            if (candidate.contains("playwm", ignoreCase = true)) {
+                baseCandidates += sanitizeHttpUrl(
+                    candidate.replace(
+                        "playwm",
+                        "play",
+                        ignoreCase = true
+                    )
+                )
+            }
+
+            // 常见无水印变体：watermark=1 -> watermark=0
+            if (candidate.contains("watermark=1", ignoreCase = true)) {
+                baseCandidates += sanitizeHttpUrl(
+                    candidate.replace(
+                        "watermark=1",
+                        "watermark=0",
+                        ignoreCase = true
+                    )
+                )
+            }
+
+            // 抖音 aweme 播放地址在不同网络/地区对 line 参数存在可达性差异：
+            // 当 line=0 受限（403）时，line=1..8 往往仍可访问。
+            baseCandidates.forEach { base ->
+                normalized += base
+                normalized += buildDouyinLineVariants(base)
+            }
+        }
+        return normalized.filter(::isLikelyDouyinVideoUrl)
+    }
+
+    private fun douyinWatermarkPenalty(url: String): Int {
+        val lower = url.lowercase()
+        var penalty = commonWatermarkPenalty(url)
+        if (lower.contains("playwm")) {
+            penalty += 2
+        }
+        if (extractQueryParameterValue(url, "line") == "0") {
+            penalty += 1
+        }
+        return penalty
+    }
+
+    private fun buildDouyinLineVariants(url: String): List<String> {
+        val lower = url.lowercase()
+        if (!(lower.contains("/aweme/v1/play/") || lower.contains("/aweme/v1/playwm/"))) {
+            return emptyList()
+        }
+
+        val variants = linkedSetOf<String>()
+        for (line in 1..8) {
+            variants += sanitizeHttpUrl(withUpdatedQueryParameter(url, "line", line.toString()))
+        }
+        variants += sanitizeHttpUrl(withUpdatedQueryParameter(url, "line", "0"))
+        return variants.toList()
+    }
+
+    private fun withUpdatedQueryParameter(url: String, key: String, value: String): String {
+        val paramPattern = Regex("""([?&])${Regex.escape(key)}=[^&#]*""", RegexOption.IGNORE_CASE)
+        if (paramPattern.containsMatchIn(url)) {
+            return paramPattern.replace(url) { match ->
+                "${match.groupValues[1]}$key=$value"
+            }
+        }
+        val separator = if (url.contains("?")) "&" else "?"
+        return "$url$separator$key=$value"
+    }
+
+    private fun extractQueryParameterValue(url: String, key: String): String? {
+        val pattern = Regex("""(?:[?&])${Regex.escape(key)}=([^&#]*)""", RegexOption.IGNORE_CASE)
+        return pattern.find(url)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun bestInstagramCandidate(candidates: Collection<String>): String? {
+        return bestCandidatePreferNoWatermark(candidates, ::isLikelyInstagramVideoUrl)
+    }
+
+    private fun bestXiaohongshuCandidate(candidates: Collection<String>): String? {
+        return bestCandidatePreferNoWatermark(candidates, ::isLikelyXiaohongshuVideoUrl)
+    }
+
+    private fun bestBilibiliCandidate(candidates: Collection<String>): String? {
+        val normalized = candidates.asSequence()
+            .map(::sanitizeHttpUrl)
+            .filter(::isLikelyBilibiliVideoUrl)
+            .distinct()
+            .toList()
+        if (normalized.isEmpty()) return null
+        return normalized.minWithOrNull(
+            compareBy<String> { bilibiliVideoPenalty(it) }
+                .thenByDescending { videoQualityScore(it) }
+        )
+    }
+
+    private fun bestBilibiliMuxedCandidate(candidates: Collection<String>): String? {
+        val normalized = candidates.asSequence()
+            .map(::sanitizeHttpUrl)
+            .filter(::isLikelyBilibiliVideoUrl)
+            .distinct()
+            .toList()
+        if (normalized.isEmpty()) return null
+        return normalized.minWithOrNull(
+            compareBy<String> { bilibiliMuxedPenalty(it) }
+                .thenByDescending { videoQualityScore(it) }
+        )
+    }
+
+    private fun bilibiliVideoPenalty(url: String): Int {
+        val lower = url.lowercase()
+        var penalty = commonWatermarkPenalty(url)
+        if (lower.contains(".m4s")) penalty += 6
+        if (lower.contains("/audio/") && !lower.contains("/video/")) penalty += 8
+        return penalty
+    }
+
+    private fun bilibiliMuxedPenalty(url: String): Int {
+        val lower = url.lowercase()
+        return when {
+            lower.contains(".mp4") || lower.contains(".flv") -> 0
+            lower.contains(".m4s") -> 5
+            else -> 2
+        }
+    }
+
+    private fun bestCandidatePreferNoWatermark(
+        candidates: Collection<String>,
+        predicate: (String) -> Boolean
+    ): String? {
+        val normalized = candidates.asSequence()
+            .map(::sanitizeHttpUrl)
+            .filter(predicate)
+            .distinct()
+            .toList()
+        if (normalized.isEmpty()) return null
+        return normalized.minWithOrNull(
+            compareBy<String> { commonWatermarkPenalty(it) }
+                .thenByDescending { videoQualityScore(it) }
+        )
+    }
+
+    private fun commonWatermarkPenalty(url: String): Int {
+        val lower = url.lowercase()
+        var penalty = 1
+        if (lower.contains("playwm") || lower.contains("wmplay")) penalty += 2
+        if (lower.contains("watermark=1") || lower.contains("watermark%3d1")) penalty += 2
+        if (lower.contains("watermark=true")) penalty += 2
+        if (lower.contains("is_watermark=1")) penalty += 2
+        if (lower.contains("logo=1") || lower.contains("logo_name=")) penalty += 1
+
+        if (lower.contains("watermark=0") || lower.contains("watermark%3d0")) penalty = 0
+        if (lower.contains("watermark=false") || lower.contains("is_watermark=0")) penalty = 0
+        if (lower.contains("no_watermark") || lower.contains("nowm")) penalty = 0
+        if (lower.contains("/aweme/v1/play/")) penalty = 0
+
+        return penalty
+    }
+
+    private fun resolveWatermarkPenalty(url: String): Int? {
+        val lower = url.lowercase()
+        val host = runCatching { URL(url).host.lowercase() }.getOrNull().orEmpty()
+        val watermarkAwareHost = host.contains("tiktok") ||
+            host.contains("musical.ly") ||
+            host.contains("douyin") ||
+            host.contains("iesdouyin") ||
+            host.contains("instagram") ||
+            host.contains("fbcdn") ||
+            host.contains("xhscdn") ||
+            host.contains("xiaohongshu") ||
+            host.contains("xhslink") ||
+            host.contains("rednote")
+        val hasWatermarkMarker = lower.contains("watermark") ||
+            lower.contains("playwm") ||
+            lower.contains("wmplay") ||
+            lower.contains("is_watermark") ||
+            lower.contains("logo=") ||
+            lower.contains("logo_name")
+        if (!watermarkAwareHost && !hasWatermarkMarker) return null
+        return commonWatermarkPenalty(url)
     }
 
     private fun isLikelyInstagramVideoUrl(url: String): Boolean {
@@ -1545,6 +2540,25 @@ class VideoDownloadRepository(
         if (host.contains("xhscdn") || host.contains("xiaohongshu")) {
             return lower.contains("video") || lower.contains("stream") || lower.contains("vod") || lower.contains("play")
         }
+        return false
+    }
+
+    private fun isLikelyBilibiliVideoUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        if (!(lower.startsWith("http://") || lower.startsWith("https://"))) return false
+        if (isLikelyAudioOnlyUrl(url)) return false
+        if (lower.contains(".jpg") || lower.contains(".jpeg") || lower.contains(".png") || lower.contains(".webp")) {
+            return false
+        }
+        if (lower.contains(".m3u8")) return false
+
+        val host = runCatching { URL(url).host.lowercase() }.getOrNull() ?: return false
+        val isBiliHost = host.contains("bilivideo") || host.contains("hdslb") || host.contains("bilibili")
+        if (!isBiliHost) return false
+
+        if (lower.contains(".mp4") || lower.contains(".flv") || lower.contains(".m4s")) return true
+        if (lower.contains("/upgcxcode/") || lower.contains("/vcodes/") || lower.contains("/pgc/")) return true
+        if (lower.contains("mime=video") || lower.contains("mime_type=video")) return true
         return false
     }
 
@@ -1591,6 +2605,26 @@ class VideoDownloadRepository(
         return XIAOHONGSHU_NOTE_ID_PATTERN.find(text)?.groupValues?.getOrNull(1)
     }
 
+    private fun extractBilibiliBvid(text: String): String? {
+        val match = BILIBILI_BVID_PATTERN.find(text)?.groupValues?.getOrNull(1) ?: return null
+        return "BV" + match.drop(2)
+    }
+
+    private fun extractBilibiliAid(text: String): Long? {
+        return BILIBILI_AID_PATTERN.find(text)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toLongOrNull()
+    }
+
+    private fun extractBilibiliPageNumber(text: String): Int? {
+        return BILIBILI_PAGE_NUMBER_PATTERN.find(text)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.takeIf { it > 0 }
+    }
+
     private fun extractYouTubeVideoId(text: String): String? {
         return YOUTUBE_VIDEO_ID_PATTERN.find(text)?.groupValues?.getOrNull(1)
     }
@@ -1611,6 +2645,9 @@ class VideoDownloadRepository(
                 .replace("\\u002F", "/")
                 .replace("\\u003D", "=")
                 .replace("\\u0025", "%")
+        }
+        if (normalized.startsWith("//")) {
+            normalized = "https:$normalized"
         }
         return normalized
     }
@@ -1683,7 +2720,7 @@ class VideoDownloadRepository(
             put(MediaStore.Video.Media.DATE_MODIFIED, System.currentTimeMillis() / 1000)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.MediaColumns.RELATIVE_PATH, MOVIES_RELATIVE_PATH)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, DOWNLOAD_RELATIVE_PATH)
                 put(MediaStore.Video.Media.IS_PENDING, 1)
             } else {
                 val targetFile = resolveLegacyTargetFile(displayName)
@@ -1705,8 +2742,8 @@ class VideoDownloadRepository(
     }
 
     private fun resolveLegacyTargetFile(displayName: String): File {
-        val moviesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
-        val targetDir = File(moviesDir, "v-down")
+        val dcimDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+        val targetDir = File(dcimDir, "v-down")
         if (!targetDir.exists() && !targetDir.mkdirs()) {
             throw IllegalStateException("无法创建 v-down 目录")
         }
@@ -1732,6 +2769,7 @@ class VideoDownloadRepository(
         )
         val extensionToVideoMime = mapOf(
             "mp4" to "video/mp4",
+            "m4s" to "video/mp4",
             "m4v" to "video/mp4",
             "mov" to "video/quicktime",
             "webm" to "video/webm",
@@ -1780,6 +2818,7 @@ class VideoDownloadRepository(
             "x.com",
             "twitter.com",
             "twimg.com",
+            "b23.tv",
             "bilibili.com",
             "bilivideo.com",
             "hdslb.com"
