@@ -36,6 +36,7 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -48,6 +49,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -66,6 +68,7 @@ import com.vdown.app.ui.theme.VDownloadTheme
 
 private enum class HomeTab(val title: String) {
     VIDEO_DOWNLOAD("视频下载"),
+    VIDEO_DEDUP("视频去重"),
     COPY_EXTRACT("文案提取"),
     SETTINGS("设置")
 }
@@ -104,6 +107,7 @@ private fun VDownloadScreen(
     }
     LaunchedEffect(selectedTab) {
         when (selectedTab) {
+            HomeTab.VIDEO_DEDUP -> viewModel.onVideoDedupTabOpened()
             HomeTab.COPY_EXTRACT -> viewModel.onCopyExtractTabOpened()
             HomeTab.SETTINGS -> {
                 viewModel.refreshLlmProviderState()
@@ -132,6 +136,15 @@ private fun VDownloadScreen(
     ) { innerPadding ->
         when (selectedTab) {
             HomeTab.VIDEO_DOWNLOAD -> VideoDownloadTabContent(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                viewModel = viewModel,
+                hasStorageWritePermission = hasStorageWritePermission,
+                onRequestStoragePermission = onRequestStoragePermission
+            )
+
+            HomeTab.VIDEO_DEDUP -> VideoDedupTabContent(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding),
@@ -390,6 +403,253 @@ private fun VideoDownloadTabContent(
             }
         }
 
+    }
+}
+
+@Composable
+private fun VideoDedupTabContent(
+    modifier: Modifier,
+    viewModel: CookieImportViewModel,
+    hasStorageWritePermission: Boolean,
+    onRequestStoragePermission: () -> Unit
+) {
+    val state = viewModel.uiState
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+
+    val openVideoLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri: Uri? ->
+            if (uri == null) return@rememberLauncherForActivityResult
+
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            viewModel.selectDedupVideo(uri)
+        }
+    )
+
+    Column(
+        modifier = modifier
+            .padding(16.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        if (!hasStorageWritePermission) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        "当前未授予文件写入权限（Android 9 及以下必需），去重导出可能失败。",
+                        color = MaterialTheme.colorScheme.error
+                    )
+                    Button(onClick = onRequestStoragePermission) {
+                        Text("立即申请写入权限")
+                    }
+                }
+            }
+        }
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("视频去重 V1", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text("首版采用重封装策略：时序微调 + 裁剪 + 重新导出，输出目录为 DCIM/v-down。")
+
+                if (state.selectedDedupVideoUri == null) {
+                    Text("当前未选择视频", color = MaterialTheme.colorScheme.error)
+                } else {
+                    Text(
+                        "当前视频：${state.selectedDedupVideoName.orEmpty()}",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        "来源：${state.selectedDedupVideoSource.orEmpty()}",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text("URI：${state.selectedDedupVideoUri}", style = MaterialTheme.typography.bodySmall)
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Button(
+                        onClick = { openVideoLauncher.launch(arrayOf("video/*")) },
+                        enabled = !state.isDedupProcessing
+                    ) {
+                        Text("选择视频")
+                    }
+                    Button(
+                        onClick = { viewModel.startVideoDedup(hasStorageWritePermission) },
+                        enabled = !state.isDedupProcessing && state.selectedDedupVideoUri != null
+                    ) {
+                        Text("开始去重")
+                    }
+                }
+
+                if (state.isDedupProcessing) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Text("处理中：${state.dedupProgress}%")
+                    }
+                }
+            }
+        }
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("时序参数", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text("速度范围建议 98~102，裁剪建议每端不超过 3000ms。", style = MaterialTheme.typography.bodySmall)
+
+                OutlinedTextField(
+                    value = state.dedupSpeedPercentDraft,
+                    onValueChange = viewModel::updateDedupSpeedPercentDraft,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("速度微调（%）") },
+                    placeholder = { Text("100") },
+                    singleLine = true,
+                    enabled = !state.isDedupProcessing
+                )
+                OutlinedTextField(
+                    value = state.dedupTrimStartMsDraft,
+                    onValueChange = viewModel::updateDedupTrimStartMsDraft,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("起始裁剪（ms）") },
+                    placeholder = { Text("120") },
+                    singleLine = true,
+                    enabled = !state.isDedupProcessing
+                )
+                OutlinedTextField(
+                    value = state.dedupTrimEndMsDraft,
+                    onValueChange = viewModel::updateDedupTrimEndMsDraft,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("结尾裁剪（ms）") },
+                    placeholder = { Text("80") },
+                    singleLine = true,
+                    enabled = !state.isDedupProcessing
+                )
+            }
+        }
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("封装参数", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("随机文件后缀（避免输出文件名重复）", style = MaterialTheme.typography.bodySmall)
+                    Switch(
+                        checked = state.dedupRandomSuffixEnabled,
+                        onCheckedChange = viewModel::setDedupRandomSuffixEnabled,
+                        enabled = !state.isDedupProcessing
+                    )
+                }
+            }
+        }
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("导出参数", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                OutlinedTextField(
+                    value = state.dedupOutputPrefixDraft,
+                    onValueChange = viewModel::updateDedupOutputPrefixDraft,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("输出前缀") },
+                    placeholder = { Text("dedup") },
+                    singleLine = true,
+                    enabled = !state.isDedupProcessing
+                )
+                Text("导出目录：DCIM/v-down", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+
+        state.dedupMessage?.let { message ->
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = message,
+                    modifier = Modifier.padding(16.dp),
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+
+        state.dedupErrorMessage?.let { message ->
+            val displayMessage = "提示：$message"
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .pointerInput(displayMessage) {
+                        detectTapGestures(
+                            onDoubleTap = {
+                                clipboardManager.setText(AnnotatedString(displayMessage))
+                            }
+                        )
+                    }
+            ) {
+                Text(
+                    text = displayMessage,
+                    modifier = Modifier.padding(16.dp),
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        }
+
+        state.dedupDiagnostics?.takeIf { it.isNotBlank() }?.let { diagnostics ->
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .pointerInput(diagnostics) {
+                        detectTapGestures(
+                            onDoubleTap = {
+                                clipboardManager.setText(AnnotatedString(diagnostics))
+                            }
+                        )
+                    }
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        "视频去重诊断日志（双击复制）",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = diagnostics,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        }
     }
 }
 

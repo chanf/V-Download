@@ -22,6 +22,8 @@ import com.vdown.app.cookie.AppDatabase
 import com.vdown.app.cookie.CookieImportRepository
 import com.vdown.app.cookie.CookieImportResult
 import com.vdown.app.cookie.VideoCookieSourceReport
+import com.vdown.app.dedup.VideoDedupRepository
+import com.vdown.app.dedup.VideoDedupRequest
 import com.vdown.app.download.VideoDownloadRepository
 import com.vdown.app.llm.LlmConfigRepository
 import com.vdown.app.llm.LlmProviderConfig
@@ -62,6 +64,21 @@ data class CookieImportUiState(
     val selectedTranscriptVideoSource: String? = null,
     val lastDownloadedVideoUri: Uri? = null,
     val lastDownloadedVideoName: String? = null,
+    val selectedDedupVideoUri: Uri? = null,
+    val selectedDedupVideoName: String? = null,
+    val selectedDedupVideoSource: String? = null,
+    val dedupSpeedPercentDraft: String = "100",
+    val dedupTrimStartMsDraft: String = "120",
+    val dedupTrimEndMsDraft: String = "80",
+    val dedupOutputPrefixDraft: String = "dedup",
+    val dedupRandomSuffixEnabled: Boolean = true,
+    val isDedupProcessing: Boolean = false,
+    val dedupProgress: Int = 0,
+    val dedupMessage: String? = null,
+    val dedupErrorMessage: String? = null,
+    val dedupDiagnostics: String? = null,
+    val lastDedupVideoUri: Uri? = null,
+    val lastDedupVideoName: String? = null,
     val isAudioControlVisible: Boolean = false,
     val isAudioPreparing: Boolean = false,
     val isAudioPlaying: Boolean = false,
@@ -89,11 +106,13 @@ data class CookieImportUiState(
 )
 
 private const val DOWNLOAD_UI_LOG_TAG = "VDownDownloadUi"
+private const val DEDUP_UI_LOG_TAG = "VDownDedupUi"
 
 class CookieImportViewModel(application: Application) : AndroidViewModel(application) {
     private val cookieDao = AppDatabase.getInstance(application).cookieDao()
     private val repository = CookieImportRepository(cookieDao)
     private val videoDownloadRepository = VideoDownloadRepository(cookieDao)
+    private val videoDedupRepository = VideoDedupRepository()
     private val transcriptRepository = VideoTranscriptRepository()
     private val llmConfigRepository = LlmConfigRepository(application)
     private val llmRewriteRepository = LlmRewriteRepository()
@@ -301,6 +320,247 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                         extra = listOf("MediaStore 中未检索到 DCIM/v-down 视频")
                     )
                 )
+            }
+        }
+    }
+
+    fun onVideoDedupTabOpened() {
+        if (uiState.selectedDedupVideoUri != null) return
+
+        viewModelScope.launch {
+            val stateSnapshot = uiState
+            val fromRecent = stateSnapshot.lastDownloadedVideoUri
+            if (fromRecent != null) {
+                val displayName = stateSnapshot.lastDownloadedVideoName
+                    ?: runCatching {
+                        transcriptRepository.resolveVideoDisplayName(getApplication(), fromRecent)
+                    }.getOrElse { fromRecent.toString() }
+
+                uiState = uiState.copy(
+                    selectedDedupVideoUri = fromRecent,
+                    selectedDedupVideoName = displayName,
+                    selectedDedupVideoSource = "视频下载最近记录",
+                    dedupMessage = "已默认选中最近下载视频：$displayName",
+                    dedupErrorMessage = null,
+                    dedupDiagnostics = buildDedupDiagnostics(
+                        phase = "默认选中视频",
+                        videoUri = fromRecent.toString(),
+                        videoName = displayName,
+                        extra = listOf("来源 = 视频下载最近记录")
+                    )
+                )
+                return@launch
+            }
+
+            val latest = runCatching {
+                transcriptRepository.queryLatestDownloadedVideo(getApplication())
+            }.getOrNull()
+
+            if (latest != null) {
+                uiState = uiState.copy(
+                    selectedDedupVideoUri = latest.uri,
+                    selectedDedupVideoName = latest.displayName,
+                    selectedDedupVideoSource = "MediaStore 最新记录",
+                    dedupMessage = "已默认选中最近视频：${latest.displayName}",
+                    dedupErrorMessage = null,
+                    dedupDiagnostics = buildDedupDiagnostics(
+                        phase = "默认选中视频",
+                        videoUri = latest.uri.toString(),
+                        videoName = latest.displayName,
+                        extra = listOf("来源 = MediaStore DCIM/v-down")
+                    )
+                )
+            } else {
+                uiState = uiState.copy(
+                    dedupMessage = "未找到可用视频，请手动选择。",
+                    dedupDiagnostics = buildDedupDiagnostics(
+                        phase = "默认选中视频失败",
+                        videoUri = null,
+                        videoName = null,
+                        extra = listOf("MediaStore 中未检索到 DCIM/v-down 视频")
+                    )
+                )
+            }
+        }
+    }
+
+    fun selectDedupVideo(uri: Uri) {
+        viewModelScope.launch {
+            val displayName = runCatching {
+                transcriptRepository.resolveVideoDisplayName(getApplication(), uri)
+            }.getOrElse { uri.toString() }
+
+            uiState = uiState.copy(
+                selectedDedupVideoUri = uri,
+                selectedDedupVideoName = displayName,
+                selectedDedupVideoSource = "手动选择",
+                dedupMessage = "已选择视频：$displayName",
+                dedupErrorMessage = null,
+                dedupDiagnostics = buildDedupDiagnostics(
+                    phase = "手动选择视频",
+                    videoUri = uri.toString(),
+                    videoName = displayName
+                )
+            )
+        }
+    }
+
+    fun updateDedupSpeedPercentDraft(value: String) {
+        uiState = uiState.copy(
+            dedupSpeedPercentDraft = value,
+            dedupErrorMessage = null
+        )
+    }
+
+    fun updateDedupTrimStartMsDraft(value: String) {
+        uiState = uiState.copy(
+            dedupTrimStartMsDraft = value,
+            dedupErrorMessage = null
+        )
+    }
+
+    fun updateDedupTrimEndMsDraft(value: String) {
+        uiState = uiState.copy(
+            dedupTrimEndMsDraft = value,
+            dedupErrorMessage = null
+        )
+    }
+
+    fun updateDedupOutputPrefixDraft(value: String) {
+        uiState = uiState.copy(
+            dedupOutputPrefixDraft = value,
+            dedupErrorMessage = null
+        )
+    }
+
+    fun setDedupRandomSuffixEnabled(enabled: Boolean) {
+        uiState = uiState.copy(
+            dedupRandomSuffixEnabled = enabled,
+            dedupErrorMessage = null
+        )
+    }
+
+    fun startVideoDedup(hasStorageWritePermission: Boolean) {
+        if (uiState.isDedupProcessing) return
+
+        val targetUri = uiState.selectedDedupVideoUri
+        val targetName = uiState.selectedDedupVideoName ?: "(未知视频)"
+        if (targetUri == null) {
+            uiState = uiState.copy(
+                dedupErrorMessage = "请先选择视频，再执行去重。",
+                dedupDiagnostics = buildDedupDiagnostics(
+                    phase = "去重前校验失败",
+                    videoUri = null,
+                    videoName = null,
+                    hasStorageWritePermission = hasStorageWritePermission,
+                    error = IllegalArgumentException("未选择视频")
+                )
+            )
+            return
+        }
+
+        val speed = parseDedupInt(
+            uiState.dedupSpeedPercentDraft,
+            fieldName = "速度微调",
+            range = 98..102
+        ) ?: return
+        val trimStart = parseDedupInt(
+            uiState.dedupTrimStartMsDraft,
+            fieldName = "起始裁剪",
+            range = 0..3_000
+        ) ?: return
+        val trimEnd = parseDedupInt(
+            uiState.dedupTrimEndMsDraft,
+            fieldName = "结尾裁剪",
+            range = 0..3_000
+        ) ?: return
+        val outputPrefix = uiState.dedupOutputPrefixDraft.trim().ifBlank { "dedup" }
+
+        viewModelScope.launch {
+            uiState = uiState.copy(
+                isDedupProcessing = true,
+                dedupProgress = 0,
+                dedupMessage = "正在执行视频去重...",
+                dedupErrorMessage = null,
+                dedupDiagnostics = buildDedupDiagnostics(
+                    phase = "开始去重",
+                    videoUri = targetUri.toString(),
+                    videoName = targetName,
+                    hasStorageWritePermission = hasStorageWritePermission,
+                    extra = listOf(
+                        "速度微调(%) = $speed",
+                        "起始裁剪(ms) = $trimStart",
+                        "结尾裁剪(ms) = $trimEnd",
+                        "输出前缀 = $outputPrefix",
+                        "随机后缀 = ${uiState.dedupRandomSuffixEnabled}",
+                        "输出目录 = DCIM/v-down"
+                    )
+                )
+            )
+
+            runCatching {
+                videoDedupRepository.dedupVideo(
+                    context = getApplication(),
+                    request = VideoDedupRequest(
+                        sourceVideoUri = targetUri,
+                        sourceVideoName = targetName,
+                        speedPercent = speed,
+                        trimStartMs = trimStart,
+                        trimEndMs = trimEnd,
+                        outputPrefix = outputPrefix,
+                        randomSuffixEnabled = uiState.dedupRandomSuffixEnabled
+                    ),
+                    hasStorageWritePermission = hasStorageWritePermission
+                ) { progress ->
+                    withContext(Dispatchers.Main) {
+                        uiState = uiState.copy(dedupProgress = progress.coerceIn(0, 100))
+                    }
+                }
+            }.onSuccess { result ->
+                val durationMs = result.durationUs / 1_000L
+                uiState = uiState.copy(
+                    isDedupProcessing = false,
+                    dedupProgress = 100,
+                    dedupMessage = "去重完成：${result.outputName}（约${durationMs}ms），已保存到 DCIM/v-down。",
+                    dedupErrorMessage = null,
+                    dedupDiagnostics = buildDedupDiagnostics(
+                        phase = "去重成功",
+                        videoUri = targetUri.toString(),
+                        videoName = targetName,
+                        hasStorageWritePermission = hasStorageWritePermission,
+                        extra = listOf(
+                            "输出文件 = ${result.outputName}",
+                            "输出 URI = ${result.outputUri}",
+                            "输出字节数 = ${result.bytesWritten}",
+                            "估算时长(us) = ${result.durationUs}",
+                            "策略 = ${result.strategySummary}"
+                        )
+                    ),
+                    lastDedupVideoUri = result.outputUri,
+                    lastDedupVideoName = result.outputName,
+                    selectedTranscriptVideoUri = result.outputUri,
+                    selectedTranscriptVideoName = result.outputName,
+                    selectedTranscriptVideoSource = "视频去重输出",
+                    transcriptMessage = "已默认选中去重输出视频，可直接导出文案。"
+                )
+                Log.i(
+                    DEDUP_UI_LOG_TAG,
+                    "dedup success input=$targetUri output=${result.outputUri} bytes=${result.bytesWritten}"
+                )
+            }.onFailure { error ->
+                uiState = uiState.copy(
+                    isDedupProcessing = false,
+                    dedupMessage = null,
+                    dedupErrorMessage = error.message ?: "视频去重失败，请稍后重试。",
+                    dedupDiagnostics = buildDedupDiagnostics(
+                        phase = "去重失败",
+                        videoUri = targetUri.toString(),
+                        videoName = targetName,
+                        hasStorageWritePermission = hasStorageWritePermission,
+                        error = error
+                    )
+                )
+                Log.e(DEDUP_UI_LOG_TAG, "dedup failed input=$targetUri message=${error.message}", error)
             }
         }
     }
@@ -1337,6 +1597,73 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
     private fun buildCookieExpiryWarning(result: CookieImportResult): String? {
         if (result.skippedExpiredLines <= 0) return null
         return "注意：检测到 ${result.skippedExpiredLines} 条视频站点 Cookie 已过期，已自动跳过。请重新导出最新 cookies.txt。"
+    }
+
+    private fun parseDedupInt(
+        raw: String,
+        fieldName: String,
+        range: IntRange
+    ): Int? {
+        val parsed = raw.trim().toIntOrNull()
+        if (parsed == null || parsed !in range) {
+            uiState = uiState.copy(
+                dedupErrorMessage = "$fieldName 参数无效，请输入 ${range.first}~${range.last} 的整数。",
+                dedupDiagnostics = buildDedupDiagnostics(
+                    phase = "去重前校验失败",
+                    videoUri = uiState.selectedDedupVideoUri?.toString(),
+                    videoName = uiState.selectedDedupVideoName,
+                    hasStorageWritePermission = true,
+                    error = IllegalArgumentException("$fieldName 超出范围: $raw"),
+                    extra = listOf("参数范围 = ${range.first}..${range.last}", "当前输入 = $raw")
+                )
+            )
+            return null
+        }
+        return parsed
+    }
+
+    private fun buildDedupDiagnostics(
+        phase: String,
+        videoUri: String?,
+        videoName: String?,
+        hasStorageWritePermission: Boolean = true,
+        error: Throwable? = null,
+        extra: List<String> = emptyList()
+    ): String {
+        val now = System.currentTimeMillis()
+        val lines = mutableListOf<String>()
+        lines += "【视频去重诊断日志】"
+        lines += "阶段 = $phase"
+        lines += "时间戳 = $now"
+        lines += "视频名称 = ${videoName ?: "(未选择)"}"
+        lines += "视频URI = ${videoUri ?: "(未选择)"}"
+        lines += "写入权限标志 = $hasStorageWritePermission"
+        lines += "速度微调草稿(%) = ${uiState.dedupSpeedPercentDraft}"
+        lines += "起始裁剪草稿(ms) = ${uiState.dedupTrimStartMsDraft}"
+        lines += "结尾裁剪草稿(ms) = ${uiState.dedupTrimEndMsDraft}"
+        lines += "输出前缀草稿 = ${uiState.dedupOutputPrefixDraft}"
+        lines += "随机后缀 = ${uiState.dedupRandomSuffixEnabled}"
+
+        if (extra.isNotEmpty()) {
+            lines += "附加信息:"
+            extra.forEach { lines += "- $it" }
+        }
+
+        if (error != null) {
+            val root = findRootCause(error)
+            lines += "异常类型 = ${error::class.java.name}"
+            lines += "异常信息 = ${error.message ?: "(空)"}"
+            lines += "根因类型 = ${root::class.java.name}"
+            lines += "根因信息 = ${root.message ?: "(空)"}"
+            val stack = error.stackTraceToString()
+                .lineSequence()
+                .take(24)
+                .joinToString(separator = "\n")
+            lines += "堆栈摘要(前24行):"
+            lines += stack
+        }
+
+        return lines.joinToString(separator = "\n")
     }
 
     private fun buildDownloadDiagnostics(
