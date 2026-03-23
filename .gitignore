@@ -28,6 +28,7 @@ video/
 artifacts/
 models/
 qa/download_automation/reports/
+qa/dedup_validation/reports/
 *.apk
 *.aab
 

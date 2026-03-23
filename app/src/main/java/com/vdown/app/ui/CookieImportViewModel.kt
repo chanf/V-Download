@@ -4,6 +4,7 @@ import android.app.Application
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.net.Uri
+import android.provider.OpenableColumns
 import android.util.Log
 import android.util.Patterns
 import androidx.compose.runtime.getValue
@@ -24,6 +25,10 @@ import com.vdown.app.cookie.CookieImportResult
 import com.vdown.app.cookie.VideoCookieSourceReport
 import com.vdown.app.dedup.VideoDedupRepository
 import com.vdown.app.dedup.VideoDedupRequest
+import com.vdown.app.dedup.DedupEndingType
+import com.vdown.app.dedup.DedupFeatureConfig
+import com.vdown.app.dedup.DedupFeatureConfigRepository
+import com.vdown.app.dedup.DedupIntroCoverMode
 import com.vdown.app.download.VideoDownloadRepository
 import com.vdown.app.llm.LlmConfigRepository
 import com.vdown.app.llm.LlmProviderConfig
@@ -37,6 +42,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
 import kotlin.math.roundToInt
 
 private data class TranscriptAttemptResult(
@@ -45,6 +51,50 @@ private data class TranscriptAttemptResult(
     val providerName: String? = null,
     val notes: List<String> = emptyList()
 )
+
+enum class DedupPresetTemplate(
+    val title: String,
+    val speedPercent: Int,
+    val trimStartMs: Int,
+    val trimEndMs: Int,
+    val ptsJitterMs: Int,
+    val randomTrimJitterMs: Int,
+    val shuffleTrackOrder: Boolean
+) {
+    LIGHT(
+        title = "轻度",
+        speedPercent = 98,
+        trimStartMs = 80,
+        trimEndMs = 100,
+        ptsJitterMs = 8,
+        randomTrimJitterMs = 20,
+        shuffleTrackOrder = false
+    ),
+    BALANCED(
+        title = "均衡",
+        speedPercent = 97,
+        trimStartMs = 120,
+        trimEndMs = 140,
+        ptsJitterMs = 16,
+        randomTrimJitterMs = 40,
+        shuffleTrackOrder = true
+    ),
+    STRONG(
+        title = "强力",
+        speedPercent = 96,
+        trimStartMs = 180,
+        trimEndMs = 220,
+        ptsJitterMs = 24,
+        randomTrimJitterMs = 60,
+        shuffleTrackOrder = true
+    );
+
+    companion object {
+        fun fromName(name: String?): DedupPresetTemplate {
+            return entries.firstOrNull { it.name == name } ?: LIGHT
+        }
+    }
+}
 
 data class CookieImportUiState(
     val urlDraft: String = "",
@@ -67,11 +117,24 @@ data class CookieImportUiState(
     val selectedDedupVideoUri: Uri? = null,
     val selectedDedupVideoName: String? = null,
     val selectedDedupVideoSource: String? = null,
-    val dedupSpeedPercentDraft: String = "100",
-    val dedupTrimStartMsDraft: String = "120",
-    val dedupTrimEndMsDraft: String = "80",
+    val dedupPresetName: String = DedupPresetTemplate.LIGHT.name,
+    val dedupSpeedPercentDraft: String = "98",
+    val dedupTrimStartMsDraft: String = "80",
+    val dedupTrimEndMsDraft: String = "100",
+    val dedupPtsJitterMsDraft: String = "8",
+    val dedupRandomTrimJitterMsDraft: String = "20",
+    val dedupSeedDraft: String = "",
+    val dedupCoverImageUri: Uri? = null,
+    val dedupCoverImageName: String? = null,
+    val dedupIntroCoverMode: DedupIntroCoverMode = DedupIntroCoverMode.NONE,
+    val dedupIntroFrameCountDraft: String = "6",
+    val dedupEndingType: DedupEndingType = DedupEndingType.NONE,
+    val dedupEndingMediaUri: Uri? = null,
+    val dedupEndingMediaName: String? = null,
+    val dedupEndingImageDurationMsDraft: String = "1200",
     val dedupOutputPrefixDraft: String = "dedup",
     val dedupRandomSuffixEnabled: Boolean = true,
+    val dedupShuffleTrackOrderEnabled: Boolean = false,
     val isDedupProcessing: Boolean = false,
     val dedupProgress: Int = 0,
     val dedupMessage: String? = null,
@@ -113,6 +176,7 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
     private val repository = CookieImportRepository(cookieDao)
     private val videoDownloadRepository = VideoDownloadRepository(cookieDao)
     private val videoDedupRepository = VideoDedupRepository()
+    private val dedupFeatureConfigRepository = DedupFeatureConfigRepository(application)
     private val transcriptRepository = VideoTranscriptRepository()
     private val llmConfigRepository = LlmConfigRepository(application)
     private val llmRewriteRepository = LlmRewriteRepository()
@@ -127,6 +191,7 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
     init {
         viewModelScope.launch {
             refreshCookieStatus()
+            loadDedupFeatureConfig()
             refreshLlmProviderState()
             refreshAsrProviderState()
         }
@@ -426,6 +491,125 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
         )
     }
 
+    fun updateDedupPtsJitterMsDraft(value: String) {
+        uiState = uiState.copy(
+            dedupPtsJitterMsDraft = value,
+            dedupErrorMessage = null
+        )
+    }
+
+    fun updateDedupRandomTrimJitterMsDraft(value: String) {
+        uiState = uiState.copy(
+            dedupRandomTrimJitterMsDraft = value,
+            dedupErrorMessage = null
+        )
+    }
+
+    fun updateDedupSeedDraft(value: String) {
+        uiState = uiState.copy(
+            dedupSeedDraft = value,
+            dedupErrorMessage = null
+        )
+    }
+
+    fun setDedupIntroCoverMode(mode: DedupIntroCoverMode) {
+        uiState = uiState.copy(
+            dedupIntroCoverMode = mode,
+            dedupErrorMessage = null
+        )
+        persistDedupFeatureConfigAsync()
+    }
+
+    fun updateDedupIntroFrameCountDraft(value: String) {
+        uiState = uiState.copy(
+            dedupIntroFrameCountDraft = value,
+            dedupErrorMessage = null
+        )
+        persistDedupFeatureConfigAsync()
+    }
+
+    fun updateDedupEndingImageDurationDraft(value: String) {
+        uiState = uiState.copy(
+            dedupEndingImageDurationMsDraft = value,
+            dedupErrorMessage = null
+        )
+        persistDedupFeatureConfigAsync()
+    }
+
+    fun selectDedupCoverImage(sourceUri: Uri) {
+        viewModelScope.launch {
+            val sourceName = runCatching { resolveDisplayName(sourceUri) }.getOrDefault("cover")
+            runCatching {
+                cacheCoverImageToInternal(sourceUri)
+            }.onSuccess { cached ->
+                val previousCoverUri = uiState.dedupCoverImageUri
+                deleteCachedCoverIfOwned(previousCoverUri, exceptPath = cached.path)
+                uiState = uiState.copy(
+                    dedupCoverImageUri = cached,
+                    dedupCoverImageName = sourceName,
+                    dedupMessage = "封面已缓存，可用于片头插入或前帧覆盖。",
+                    dedupErrorMessage = null
+                )
+                persistDedupFeatureConfigAsync()
+            }.onFailure { error ->
+                uiState = uiState.copy(
+                    dedupErrorMessage = "封面缓存失败：${error.message ?: "无法读取图片"}"
+                )
+            }
+        }
+    }
+
+    fun clearDedupCoverImage() {
+        val oldUri = uiState.dedupCoverImageUri
+        deleteCachedCoverIfOwned(oldUri, exceptPath = null)
+        uiState = uiState.copy(
+            dedupCoverImageUri = null,
+            dedupCoverImageName = null,
+            dedupMessage = "已清除封面设置。",
+            dedupErrorMessage = null
+        )
+        persistDedupFeatureConfigAsync()
+    }
+
+    fun selectDedupEndingImage(uri: Uri) {
+        viewModelScope.launch {
+            val displayName = resolveDisplayName(uri)
+            uiState = uiState.copy(
+                dedupEndingType = DedupEndingType.IMAGE,
+                dedupEndingMediaUri = uri,
+                dedupEndingMediaName = displayName,
+                dedupMessage = "已设置图片片尾：$displayName",
+                dedupErrorMessage = null
+            )
+            persistDedupFeatureConfigAsync()
+        }
+    }
+
+    fun selectDedupEndingVideo(uri: Uri) {
+        viewModelScope.launch {
+            val displayName = resolveDisplayName(uri)
+            uiState = uiState.copy(
+                dedupEndingType = DedupEndingType.VIDEO,
+                dedupEndingMediaUri = uri,
+                dedupEndingMediaName = displayName,
+                dedupMessage = "已设置视频片尾：$displayName",
+                dedupErrorMessage = null
+            )
+            persistDedupFeatureConfigAsync()
+        }
+    }
+
+    fun clearDedupEnding() {
+        uiState = uiState.copy(
+            dedupEndingType = DedupEndingType.NONE,
+            dedupEndingMediaUri = null,
+            dedupEndingMediaName = null,
+            dedupMessage = "已清除片尾设置。",
+            dedupErrorMessage = null
+        )
+        persistDedupFeatureConfigAsync()
+    }
+
     fun updateDedupOutputPrefixDraft(value: String) {
         uiState = uiState.copy(
             dedupOutputPrefixDraft = value,
@@ -436,6 +620,27 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
     fun setDedupRandomSuffixEnabled(enabled: Boolean) {
         uiState = uiState.copy(
             dedupRandomSuffixEnabled = enabled,
+            dedupErrorMessage = null
+        )
+    }
+
+    fun setDedupShuffleTrackOrderEnabled(enabled: Boolean) {
+        uiState = uiState.copy(
+            dedupShuffleTrackOrderEnabled = enabled,
+            dedupErrorMessage = null
+        )
+    }
+
+    fun applyDedupPreset(template: DedupPresetTemplate) {
+        uiState = uiState.copy(
+            dedupPresetName = template.name,
+            dedupSpeedPercentDraft = template.speedPercent.toString(),
+            dedupTrimStartMsDraft = template.trimStartMs.toString(),
+            dedupTrimEndMsDraft = template.trimEndMs.toString(),
+            dedupPtsJitterMsDraft = template.ptsJitterMs.toString(),
+            dedupRandomTrimJitterMsDraft = template.randomTrimJitterMs.toString(),
+            dedupShuffleTrackOrderEnabled = template.shuffleTrackOrder,
+            dedupMessage = "已应用去重模板：${template.title}",
             dedupErrorMessage = null
         )
     }
@@ -462,7 +667,7 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
         val speed = parseDedupInt(
             uiState.dedupSpeedPercentDraft,
             fieldName = "速度微调",
-            range = 98..102
+            range = 95..105
         ) ?: return
         val trimStart = parseDedupInt(
             uiState.dedupTrimStartMsDraft,
@@ -474,7 +679,76 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
             fieldName = "结尾裁剪",
             range = 0..3_000
         ) ?: return
+        val ptsJitterMs = parseDedupInt(
+            uiState.dedupPtsJitterMsDraft,
+            fieldName = "时间微扰",
+            range = 0..40
+        ) ?: return
+        val randomTrimJitterMs = parseDedupInt(
+            uiState.dedupRandomTrimJitterMsDraft,
+            fieldName = "随机裁剪抖动",
+            range = 0..600
+        ) ?: return
+        val seedRaw = uiState.dedupSeedDraft.trim()
+        val dedupSeed = if (seedRaw.isBlank()) null else seedRaw.toLongOrNull()
+        if (seedRaw.isNotBlank() && (dedupSeed == null || dedupSeed < 0L)) {
+            uiState = uiState.copy(
+                dedupErrorMessage = "随机种子参数无效，请输入大于等于 0 的整数，或留空自动生成。",
+                dedupDiagnostics = buildDedupDiagnostics(
+                    phase = "去重前校验失败",
+                    videoUri = uiState.selectedDedupVideoUri?.toString(),
+                    videoName = uiState.selectedDedupVideoName,
+                    hasStorageWritePermission = hasStorageWritePermission,
+                    error = IllegalArgumentException("随机种子非法: $seedRaw"),
+                    extra = listOf("参数范围 = >=0（留空自动生成）", "当前输入 = $seedRaw")
+                )
+            )
+            return
+        }
+        val introFrameCount = parseDedupInt(
+            uiState.dedupIntroFrameCountDraft,
+            fieldName = "片头帧数",
+            range = 1..60
+        ) ?: return
+        val endingImageDurationMs = parseDedupInt(
+            uiState.dedupEndingImageDurationMsDraft,
+            fieldName = "图片片尾时长",
+            range = 300..10_000
+        ) ?: return
+        val introCoverMode = uiState.dedupIntroCoverMode
+        val coverImageUri = uiState.dedupCoverImageUri
+        val endingType = uiState.dedupEndingType
+        val endingMediaUri = uiState.dedupEndingMediaUri
+        if (introCoverMode != DedupIntroCoverMode.NONE && coverImageUri == null) {
+            uiState = uiState.copy(
+                dedupErrorMessage = "已启用片头模式，但未选择封面图片。",
+                dedupDiagnostics = buildDedupDiagnostics(
+                    phase = "去重前校验失败",
+                    videoUri = uiState.selectedDedupVideoUri?.toString(),
+                    videoName = uiState.selectedDedupVideoName,
+                    hasStorageWritePermission = hasStorageWritePermission,
+                    error = IllegalArgumentException("片头封面为空"),
+                    extra = listOf("片头模式 = ${introCoverMode.title}")
+                )
+            )
+            return
+        }
+        if (endingType != DedupEndingType.NONE && endingMediaUri == null) {
+            uiState = uiState.copy(
+                dedupErrorMessage = "已启用片尾，但未选择片尾素材。",
+                dedupDiagnostics = buildDedupDiagnostics(
+                    phase = "去重前校验失败",
+                    videoUri = uiState.selectedDedupVideoUri?.toString(),
+                    videoName = uiState.selectedDedupVideoName,
+                    hasStorageWritePermission = hasStorageWritePermission,
+                    error = IllegalArgumentException("片尾素材为空"),
+                    extra = listOf("片尾类型 = ${endingType.title}")
+                )
+            )
+            return
+        }
         val outputPrefix = uiState.dedupOutputPrefixDraft.trim().ifBlank { "dedup" }
+        val dedupPreset = DedupPresetTemplate.fromName(uiState.dedupPresetName)
 
         viewModelScope.launch {
             uiState = uiState.copy(
@@ -491,8 +765,19 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                         "速度微调(%) = $speed",
                         "起始裁剪(ms) = $trimStart",
                         "结尾裁剪(ms) = $trimEnd",
+                        "时间微扰(ms) = $ptsJitterMs",
+                        "随机裁剪抖动(ms) = $randomTrimJitterMs",
+                        "随机种子(Seed输入) = ${dedupSeed?.toString() ?: "自动生成"}",
+                        "封面图片 = ${if (coverImageUri != null) (uiState.dedupCoverImageName ?: coverImageUri.toString()) else "未设置"}",
+                        "片头模式 = ${introCoverMode.title}",
+                        "片头帧数 = $introFrameCount",
+                        "片尾类型 = ${endingType.title}",
+                        "片尾素材 = ${if (endingMediaUri != null) (uiState.dedupEndingMediaName ?: endingMediaUri.toString()) else "未设置"}",
+                        "图片片尾时长(ms) = $endingImageDurationMs",
                         "输出前缀 = $outputPrefix",
                         "随机后缀 = ${uiState.dedupRandomSuffixEnabled}",
+                        "轨道顺序扰动 = ${uiState.dedupShuffleTrackOrderEnabled}",
+                        "模板 = ${dedupPreset.title}",
                         "输出目录 = DCIM/v-down"
                     )
                 )
@@ -504,11 +789,22 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                     request = VideoDedupRequest(
                         sourceVideoUri = targetUri,
                         sourceVideoName = targetName,
+                        presetName = dedupPreset.title,
                         speedPercent = speed,
                         trimStartMs = trimStart,
                         trimEndMs = trimEnd,
+                        ptsJitterMs = ptsJitterMs,
+                        randomTrimJitterMs = randomTrimJitterMs,
+                        shuffleTrackOrder = uiState.dedupShuffleTrackOrderEnabled,
                         outputPrefix = outputPrefix,
-                        randomSuffixEnabled = uiState.dedupRandomSuffixEnabled
+                        randomSuffixEnabled = uiState.dedupRandomSuffixEnabled,
+                        seed = dedupSeed,
+                        coverImageUri = coverImageUri,
+                        introCoverMode = introCoverMode,
+                        introFrameCount = introFrameCount,
+                        endingType = endingType,
+                        endingMediaUri = endingMediaUri,
+                        endingImageDurationMs = endingImageDurationMs
                     ),
                     hasStorageWritePermission = hasStorageWritePermission
                 ) { progress ->
@@ -533,6 +829,18 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                             "输出 URI = ${result.outputUri}",
                             "输出字节数 = ${result.bytesWritten}",
                             "估算时长(us) = ${result.durationUs}",
+                            "实际Seed = ${result.actualSeed}",
+                            "起始附加裁剪(ms) = ${result.startTrimExtraMs}",
+                            "结尾附加裁剪(ms) = ${result.endTrimExtraMs}",
+                            "源MD5 = ${result.sourceMd5}",
+                            "输出MD5 = ${result.outputMd5}",
+                            "哈希是否变化 = ${if (result.sourceMd5.equals(result.outputMd5, ignoreCase = true)) "否" else "是"}",
+                            "封面应用 = ${if (result.coverApplied) "是" else "否"}",
+                            "片头模式 = ${result.introModeApplied}",
+                            "片头帧率(FPS) = ${result.sourceFrameRate}",
+                            "片头生效帧数 = ${result.introFrameCountApplied}",
+                            "覆盖模式是否生效 = ${if (result.overlayApplied) "是" else "否"}",
+                            "片尾应用 = ${result.endingApplied}",
                             "策略 = ${result.strategySummary}"
                         )
                     ),
@@ -548,6 +856,14 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                     "dedup success input=$targetUri output=${result.outputUri} bytes=${result.bytesWritten}"
                 )
             }.onFailure { error ->
+                val dedupFailureContext = listOf(
+                    "片头模式 = ${uiState.dedupIntroCoverMode.title}",
+                    "片头帧数 = ${uiState.dedupIntroFrameCountDraft}",
+                    "封面素材URI方案 = ${uiState.dedupCoverImageUri?.scheme ?: "N/A"}",
+                    "片尾类型 = ${uiState.dedupEndingType.title}",
+                    "片尾素材URI方案 = ${uiState.dedupEndingMediaUri?.scheme ?: "N/A"}",
+                    "随机种子草稿 = ${uiState.dedupSeedDraft.ifBlank { "(自动生成)" }}"
+                )
                 uiState = uiState.copy(
                     isDedupProcessing = false,
                     dedupMessage = null,
@@ -557,7 +873,8 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                         videoUri = targetUri.toString(),
                         videoName = targetName,
                         hasStorageWritePermission = hasStorageWritePermission,
-                        error = error
+                        error = error,
+                        extra = dedupFailureContext
                     )
                 )
                 Log.e(DEDUP_UI_LOG_TAG, "dedup failed input=$targetUri message=${error.message}", error)
@@ -1530,6 +1847,108 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
         )
     }
 
+    private suspend fun loadDedupFeatureConfig() {
+        val config = withContext(Dispatchers.IO) {
+            dedupFeatureConfigRepository.loadConfig()
+        }
+        val coverUri = config.coverImageCachePath
+            ?.takeIf { it.isNotBlank() }
+            ?.let(::File)
+            ?.takeIf { it.exists() && it.isFile }
+            ?.let { Uri.fromFile(it) }
+        val endingUri = config.endingMediaUri
+            ?.takeIf { it.isNotBlank() }
+            ?.let(Uri::parse)
+        val endingType = if (endingUri == null) DedupEndingType.NONE else config.endingType
+        val introMode = if (coverUri == null) DedupIntroCoverMode.NONE else config.introCoverMode
+        uiState = uiState.copy(
+            dedupCoverImageUri = coverUri,
+            dedupCoverImageName = config.coverImageName
+                ?: coverUri?.lastPathSegment
+                ?: coverUri?.toString(),
+            dedupIntroCoverMode = introMode,
+            dedupIntroFrameCountDraft = config.introFrameCount.toString(),
+            dedupEndingType = endingType,
+            dedupEndingMediaUri = endingUri,
+            dedupEndingMediaName = config.endingMediaName,
+            dedupEndingImageDurationMsDraft = config.endingImageDurationMs.toString()
+        )
+    }
+
+    private fun persistDedupFeatureConfigAsync() {
+        val snapshot = uiState
+        viewModelScope.launch(Dispatchers.IO) {
+            val coverPath = snapshot.dedupCoverImageUri
+                ?.takeIf { it.scheme == "file" }
+                ?.path
+                ?.takeIf { it.isNotBlank() }
+            val endingUri = snapshot.dedupEndingMediaUri?.toString()
+            val config = DedupFeatureConfig(
+                coverImageCachePath = coverPath,
+                coverImageName = snapshot.dedupCoverImageName,
+                introCoverMode = snapshot.dedupIntroCoverMode,
+                introFrameCount = snapshot.dedupIntroFrameCountDraft.trim()
+                    .toIntOrNull()
+                    ?.coerceIn(1, 60)
+                    ?: 6,
+                endingType = if (endingUri.isNullOrBlank()) DedupEndingType.NONE else snapshot.dedupEndingType,
+                endingMediaUri = endingUri,
+                endingMediaName = snapshot.dedupEndingMediaName,
+                endingImageDurationMs = snapshot.dedupEndingImageDurationMsDraft.trim()
+                    .toIntOrNull()
+                    ?.coerceIn(300, 10_000)
+                    ?: 1200
+            )
+            dedupFeatureConfigRepository.saveConfig(config)
+        }
+    }
+
+    private suspend fun cacheCoverImageToInternal(sourceUri: Uri): Uri = withContext(Dispatchers.IO) {
+        val app = getApplication<Application>()
+        val resolver = app.contentResolver
+        val sourceName = resolveDisplayName(sourceUri)
+        val extension = sourceName.substringAfterLast('.', "")
+            .lowercase(Locale.ROOT)
+            .takeIf { it in setOf("jpg", "jpeg", "png", "webp", "bmp") }
+            ?: "jpg"
+        val assetDir = File(app.filesDir, "dedup-assets")
+        if (!assetDir.exists() && !assetDir.mkdirs()) {
+            throw IllegalStateException("无法创建封面缓存目录")
+        }
+        val targetFile = File(assetDir, "cover_cached.$extension")
+        resolver.openInputStream(sourceUri)?.use { input ->
+            targetFile.outputStream().use { output ->
+                input.copyTo(output, 64 * 1024)
+                output.flush()
+            }
+        } ?: throw IllegalStateException("无法读取所选封面图片")
+        Uri.fromFile(targetFile)
+    }
+
+    private fun deleteCachedCoverIfOwned(uri: Uri?, exceptPath: String?) {
+        val path = uri
+            ?.takeIf { it.scheme == "file" }
+            ?.path
+            ?.takeIf { it.startsWith(getApplication<Application>().filesDir.absolutePath) }
+            ?: return
+        if (!exceptPath.isNullOrBlank() && path == exceptPath) return
+        runCatching {
+            File(path).takeIf { it.exists() }?.delete()
+        }
+    }
+
+    private suspend fun resolveDisplayName(uri: Uri): String = withContext(Dispatchers.IO) {
+        val resolver = getApplication<Application>().contentResolver
+        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (index >= 0 && cursor.moveToFirst()) {
+                val value = cursor.getString(index)
+                if (!value.isNullOrBlank()) return@withContext value
+            }
+        }
+        uri.lastPathSegment ?: uri.toString()
+    }
+
     private fun normalizeUrl(raw: String): String? {
         val text = raw.trim()
         if (text.isBlank()) return null
@@ -1638,11 +2057,24 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
         lines += "视频名称 = ${videoName ?: "(未选择)"}"
         lines += "视频URI = ${videoUri ?: "(未选择)"}"
         lines += "写入权限标志 = $hasStorageWritePermission"
+        lines += "模板草稿 = ${DedupPresetTemplate.fromName(uiState.dedupPresetName).title}"
         lines += "速度微调草稿(%) = ${uiState.dedupSpeedPercentDraft}"
         lines += "起始裁剪草稿(ms) = ${uiState.dedupTrimStartMsDraft}"
         lines += "结尾裁剪草稿(ms) = ${uiState.dedupTrimEndMsDraft}"
+        lines += "时间微扰草稿(ms) = ${uiState.dedupPtsJitterMsDraft}"
+        lines += "随机裁剪抖动草稿(ms) = ${uiState.dedupRandomTrimJitterMsDraft}"
+        lines += "随机种子草稿(seed) = ${uiState.dedupSeedDraft.ifBlank { "(自动生成)" }}"
+        lines += "封面图片 = ${uiState.dedupCoverImageName ?: "(未设置)"}"
+        lines += "封面图片URI = ${uiState.dedupCoverImageUri?.toString() ?: "(未设置)"}"
+        lines += "片头模式 = ${uiState.dedupIntroCoverMode.title}"
+        lines += "片头帧数草稿 = ${uiState.dedupIntroFrameCountDraft}"
+        lines += "片尾类型 = ${uiState.dedupEndingType.title}"
+        lines += "片尾素材 = ${uiState.dedupEndingMediaName ?: "(未设置)"}"
+        lines += "片尾素材URI = ${uiState.dedupEndingMediaUri?.toString() ?: "(未设置)"}"
+        lines += "图片片尾时长草稿(ms) = ${uiState.dedupEndingImageDurationMsDraft}"
         lines += "输出前缀草稿 = ${uiState.dedupOutputPrefixDraft}"
         lines += "随机后缀 = ${uiState.dedupRandomSuffixEnabled}"
+        lines += "轨道顺序扰动 = ${uiState.dedupShuffleTrackOrderEnabled}"
 
         if (extra.isNotEmpty()) {
             lines += "附加信息:"

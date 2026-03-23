@@ -19,6 +19,7 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.RandomAccessFile
+import java.net.HttpCookie
 import java.net.HttpURLConnection
 import java.net.URLDecoder
 import java.net.URLEncoder
@@ -37,6 +38,7 @@ private const val PARALLEL_DOWNLOAD_MIN_BYTES = 4L * 1024L * 1024L
 private const val PARALLEL_DOWNLOAD_TARGET_SEGMENT_BYTES = 2L * 1024L * 1024L
 private const val PARALLEL_DOWNLOAD_MAX_SEGMENTS = 6
 private const val PARALLEL_DOWNLOAD_MIN_SEGMENTS = 2
+private const val RUNTIME_COOKIE_SOURCE_FILE = "runtime_set_cookie"
 private const val MOBILE_SAFARI_UA =
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 private const val ANDROID_CHROME_UA =
@@ -372,6 +374,7 @@ class VideoDownloadRepository(
             var keepConnection = false
             try {
                 val code = connection.responseCode
+                persistResponseCookies(connection, currentUrl)
                 if (code in 300..399) {
                     val location = connection.getHeaderField("Location")
                     if (!location.isNullOrBlank()) {
@@ -486,6 +489,7 @@ class VideoDownloadRepository(
 
         return try {
             val code = connection.responseCode
+            persistResponseCookies(connection, url)
             code == 206 || connection.getHeaderField("Content-Range")
                 ?.lowercase()
                 ?.startsWith("bytes 0-0/")
@@ -563,6 +567,7 @@ class VideoDownloadRepository(
         val connection = openRangeConnection(finalUrl = finalUrl, start = start, end = end)
         try {
             val code = connection.responseCode
+            persistResponseCookies(connection, URL(finalUrl))
             if (code != 206) {
                 throw IllegalStateException("分片下载失败：HTTP $code（Range $start-$end）")
             }
@@ -726,6 +731,76 @@ class VideoDownloadRepository(
             .sortedByDescending { it.path.length }
 
         return matched.joinToString(separator = "; ") { "${it.name}=${it.value}" }
+    }
+
+    private suspend fun persistResponseCookies(connection: HttpURLConnection, requestUrl: URL) {
+        val headerValues = connection.headerFields
+            .asSequence()
+            .filter { (key, _) -> key.equals("Set-Cookie", ignoreCase = true) }
+            .flatMap { (_, values) -> values.orEmpty().asSequence() }
+            .filter { it.isNotBlank() }
+            .toList()
+        if (headerValues.isEmpty()) return
+
+        val nowEpochSeconds = System.currentTimeMillis() / 1000
+        val nowEpochMillis = System.currentTimeMillis()
+        val requestHost = requestUrl.host.lowercase().removePrefix(".")
+        if (requestHost.isBlank()) return
+
+        val entities = mutableListOf<CookieEntity>()
+        for (header in headerValues) {
+            val parsedCookies = runCatching { HttpCookie.parse(header) }.getOrDefault(emptyList())
+            for (cookie in parsedCookies) {
+                val name = cookie.name.orEmpty().trim()
+                if (name.isBlank()) continue
+                val value = cookie.value.orEmpty()
+
+                val rawDomain = cookie.domain.orEmpty().trim()
+                val domain = if (rawDomain.isBlank()) {
+                    requestHost
+                } else {
+                    rawDomain.lowercase().removePrefix(".")
+                }
+                if (domain.isBlank()) continue
+
+                val domainMatches = requestHost == domain || requestHost.endsWith(".$domain")
+                if (!domainMatches) continue
+
+                val defaultPath = defaultCookiePath(requestUrl.path)
+                val path = cookie.path?.trim().takeIf { !it.isNullOrBlank() } ?: defaultPath
+                val maxAge = cookie.maxAge
+                val expiresAtEpochSeconds = when {
+                    maxAge == 0L -> nowEpochSeconds - 1
+                    maxAge > 0L -> nowEpochSeconds + maxAge
+                    else -> null
+                }
+
+                entities += CookieEntity(
+                    domain = domain,
+                    includeSubDomains = rawDomain.startsWith("."),
+                    path = path,
+                    secure = cookie.secure,
+                    httpOnly = cookie.isHttpOnly,
+                    expiresAtEpochSeconds = expiresAtEpochSeconds,
+                    name = name,
+                    value = value,
+                    sourceFileName = RUNTIME_COOKIE_SOURCE_FILE,
+                    importedAtEpochMillis = nowEpochMillis
+                )
+            }
+        }
+
+        if (entities.isEmpty()) return
+
+        cookieDao.upsertAll(entities)
+        cookieDao.deleteExpired(nowEpochSeconds)
+    }
+
+    private fun defaultCookiePath(requestPath: String): String {
+        if (requestPath.isBlank() || !requestPath.startsWith("/")) return "/"
+        val index = requestPath.lastIndexOf('/')
+        if (index <= 0) return "/"
+        return requestPath.substring(0, index)
     }
 
     private fun matchDomain(host: String, cookie: CookieEntity): Boolean {
@@ -1431,6 +1506,7 @@ class VideoDownloadRepository(
 
         return try {
             val code = connection.responseCode
+            persistResponseCookies(connection, URL(apiUrl))
             val stream = if (code in 200..299) {
                 connection.inputStream
             } else {
@@ -1845,6 +1921,7 @@ class VideoDownloadRepository(
 
             try {
                 val code = connection.responseCode
+                persistResponseCookies(connection, currentUrl)
                 if (code in 300..399) {
                     val location = connection.getHeaderField("Location") ?: return currentUrl.toString()
                     currentUrl = URL(currentUrl, location)
@@ -1916,7 +1993,7 @@ class VideoDownloadRepository(
         val ordered = normalizeYouTubeCandidates(candidates)
         if (ordered.isEmpty()) return null
 
-        ordered.take(MAX_YOUTUBE_CANDIDATE_PROBES).forEach { candidate ->
+        for (candidate in ordered.take(MAX_YOUTUBE_CANDIDATE_PROBES)) {
             if (isYouTubeCandidateReachable(candidate)) {
                 return candidate
             }
@@ -1924,9 +2001,10 @@ class VideoDownloadRepository(
         return null
     }
 
-    private fun isYouTubeCandidateReachable(url: String): Boolean {
-        return runCatching {
-            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+    private suspend fun isYouTubeCandidateReachable(url: String): Boolean {
+        return try {
+            val targetUrl = URL(url)
+            val connection = (targetUrl.openConnection() as HttpURLConnection).apply {
                 instanceFollowRedirects = true
                 requestMethod = "GET"
                 connectTimeout = 12_000
@@ -1942,8 +2020,9 @@ class VideoDownloadRepository(
 
             try {
                 val code = connection.responseCode
+                persistResponseCookies(connection, targetUrl)
                 if (code !in 200..299 && code != 206) {
-                    return@runCatching false
+                    return false
                 }
 
                 val mimeType = connection.contentType
@@ -1952,18 +2031,20 @@ class VideoDownloadRepository(
                     ?.lowercase()
                     .orEmpty()
                 if (mimeType.startsWith("video/")) {
-                    return@runCatching true
+                    return true
                 }
                 if ((mimeType == "application/octet-stream" || mimeType == "binary/octet-stream") &&
                     isLikelyYouTubeVideoUrl(url)
                 ) {
-                    return@runCatching true
+                    return true
                 }
-                return@runCatching mimeType.isBlank() && isLikelyYouTubeVideoUrl(url)
+                mimeType.isBlank() && isLikelyYouTubeVideoUrl(url)
             } finally {
                 connection.disconnect()
             }
-        }.getOrDefault(false)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun youtubeCandidateRank(url: String): Int {
@@ -2061,6 +2142,7 @@ class VideoDownloadRepository(
 
             try {
                 val code = connection.responseCode
+                persistResponseCookies(connection, currentUrl)
                 if (code in 300..399) {
                     val location = connection.getHeaderField("Location") ?: return ""
                     currentUrl = URL(currentUrl, location)
@@ -2115,6 +2197,7 @@ class VideoDownloadRepository(
         return try {
             connection.outputStream.bufferedWriter().use { it.write(body) }
             val code = connection.responseCode
+            persistResponseCookies(connection, url)
             val stream = if (code in 200..299) {
                 connection.inputStream
             } else {

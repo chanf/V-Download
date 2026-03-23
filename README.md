@@ -208,6 +208,33 @@ app/
 - 输出包含：`[PASS] 文案与标点完全一致`
 - 且最终打印：`[5/5] 回归测试通过`
 
+## 回归测试脚本（视频去重重复度）
+
+### 目录与文件
+- 脚本目录：`qa/dedup_validation/`
+- 一键脚本：`qa/dedup_validation/run_dedup_eval.sh`
+- 核心评估：`qa/dedup_validation/dedup_similarity_eval.py`
+
+### 作用
+- 输入“原视频 + 去重后视频”
+- 输出重复度报告（含结论）和图表
+- 产出：
+  - `result.json`（机器可读）
+  - `report.md`（人工可读）
+  - `chart_scores.png`（核心指标柱状图）
+  - `chart_frame_distance_hist.png`（帧距离分布图）
+  - `chart_audio_corr_curve.png`（音频相关性曲线图）
+
+### 一键执行
+```bash
+qa/dedup_validation/run_dedup_eval.sh \
+  "video/source.mp4" \
+  "video/dedup.mp4"
+```
+
+### 报告目录
+- 默认输出到：`qa/dedup_validation/reports/run_YYYYmmdd_HHMMSS/`
+
 ## 版本约定
 - 默认每次打包仅升级 `versionName` 第三段（patch）
 - 同时递增 `versionCode` 以保证可覆盖安装

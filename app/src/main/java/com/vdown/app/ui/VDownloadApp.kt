@@ -60,6 +60,8 @@ import com.vdown.app.asr.AsrLanguageOption
 import com.vdown.app.asr.AsrProviderType
 import com.vdown.app.asr.defaultAsrBaseUrlFor
 import com.vdown.app.asr.defaultAsrModelFor
+import com.vdown.app.dedup.DedupEndingType
+import com.vdown.app.dedup.DedupIntroCoverMode
 import com.vdown.app.llm.LlmProviderType
 import com.vdown.app.llm.defaultBaseUrlFor
 import com.vdown.app.llm.defaultLlmSystemPrompt
@@ -406,6 +408,7 @@ private fun VideoDownloadTabContent(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun VideoDedupTabContent(
     modifier: Modifier,
@@ -416,6 +419,11 @@ private fun VideoDedupTabContent(
     val state = viewModel.uiState
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
+    var dedupPresetMenuExpanded by rememberSaveable { mutableStateOf(false) }
+    var introCoverModeMenuExpanded by rememberSaveable { mutableStateOf(false) }
+    val currentDedupPreset = remember(state.dedupPresetName) {
+        DedupPresetTemplate.fromName(state.dedupPresetName)
+    }
 
     val openVideoLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -429,6 +437,45 @@ private fun VideoDedupTabContent(
                 )
             }
             viewModel.selectDedupVideo(uri)
+        }
+    )
+    val openCoverImageLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri: Uri? ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            viewModel.selectDedupCoverImage(uri)
+        }
+    )
+    val openEndingImageLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri: Uri? ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            viewModel.selectDedupEndingImage(uri)
+        }
+    )
+    val openEndingVideoLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri: Uri? ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            viewModel.selectDedupEndingVideo(uri)
         }
     )
 
@@ -512,15 +559,165 @@ private fun VideoDedupTabContent(
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
+                Text("片头封面", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text("封面会被缓存到应用内，可用于“插入封面帧”或“覆盖前若干帧”模式。", style = MaterialTheme.typography.bodySmall)
+                ExposedDropdownMenuBox(
+                    expanded = introCoverModeMenuExpanded,
+                    onExpandedChange = { introCoverModeMenuExpanded = !introCoverModeMenuExpanded }
+                ) {
+                    OutlinedTextField(
+                        value = state.dedupIntroCoverMode.title,
+                        onValueChange = {},
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .menuAnchor(),
+                        readOnly = true,
+                        label = { Text("片头模式") },
+                        trailingIcon = {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = introCoverModeMenuExpanded)
+                        },
+                        enabled = !state.isDedupProcessing
+                    )
+                    DropdownMenu(
+                        expanded = introCoverModeMenuExpanded,
+                        onDismissRequest = { introCoverModeMenuExpanded = false }
+                    ) {
+                        DedupIntroCoverMode.entries.forEach { mode ->
+                            DropdownMenuItem(
+                                text = { Text(mode.title) },
+                                onClick = {
+                                    introCoverModeMenuExpanded = false
+                                    viewModel.setDedupIntroCoverMode(mode)
+                                }
+                            )
+                        }
+                    }
+                }
+                Text("当前封面：${state.dedupCoverImageName ?: "未设置"}", style = MaterialTheme.typography.bodySmall)
+                Text("封面URI：${state.dedupCoverImageUri ?: "(未设置)"}", style = MaterialTheme.typography.bodySmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Button(
+                        onClick = { openCoverImageLauncher.launch(arrayOf("image/*")) },
+                        enabled = !state.isDedupProcessing
+                    ) {
+                        Text("选择封面图")
+                    }
+                    Button(
+                        onClick = viewModel::clearDedupCoverImage,
+                        enabled = !state.isDedupProcessing && state.dedupCoverImageUri != null
+                    ) {
+                        Text("清除封面")
+                    }
+                }
+                OutlinedTextField(
+                    value = state.dedupIntroFrameCountDraft,
+                    onValueChange = viewModel::updateDedupIntroFrameCountDraft,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("片头帧数（1~60）") },
+                    placeholder = { Text("6") },
+                    singleLine = true,
+                    enabled = !state.isDedupProcessing
+                )
+            }
+        }
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("片尾拼接", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text("可选择图片片尾或视频片尾，自动拼接到输出末尾。", style = MaterialTheme.typography.bodySmall)
+                Text("片尾类型：${state.dedupEndingType.title}", style = MaterialTheme.typography.bodySmall)
+                Text("片尾素材：${state.dedupEndingMediaName ?: "未设置"}", style = MaterialTheme.typography.bodySmall)
+                Text("片尾URI：${state.dedupEndingMediaUri ?: "(未设置)"}", style = MaterialTheme.typography.bodySmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Button(
+                        onClick = { openEndingImageLauncher.launch(arrayOf("image/*")) },
+                        enabled = !state.isDedupProcessing
+                    ) {
+                        Text("图片片尾")
+                    }
+                    Button(
+                        onClick = { openEndingVideoLauncher.launch(arrayOf("video/*")) },
+                        enabled = !state.isDedupProcessing
+                    ) {
+                        Text("视频片尾")
+                    }
+                    Button(
+                        onClick = viewModel::clearDedupEnding,
+                        enabled = !state.isDedupProcessing && state.dedupEndingType != DedupEndingType.NONE
+                    ) {
+                        Text("清除片尾")
+                    }
+                }
+                OutlinedTextField(
+                    value = state.dedupEndingImageDurationMsDraft,
+                    onValueChange = viewModel::updateDedupEndingImageDurationDraft,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("图片片尾时长（ms）") },
+                    placeholder = { Text("1200") },
+                    singleLine = true,
+                    enabled = !state.isDedupProcessing
+                )
+            }
+        }
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("模板参数", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "建议优先从模板开始，再做小范围微调。模板会自动填充下方参数。",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Box {
+                    Button(
+                        onClick = { dedupPresetMenuExpanded = true },
+                        enabled = !state.isDedupProcessing
+                    ) {
+                        Text("模板：${currentDedupPreset.title}")
+                    }
+                    DropdownMenu(
+                        expanded = dedupPresetMenuExpanded,
+                        onDismissRequest = { dedupPresetMenuExpanded = false }
+                    ) {
+                        DedupPresetTemplate.entries.forEach { template ->
+                            DropdownMenuItem(
+                                text = { Text(template.title) },
+                                onClick = {
+                                    dedupPresetMenuExpanded = false
+                                    viewModel.applyDedupPreset(template)
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 Text("时序参数", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                Text("速度范围建议 98~102，裁剪建议每端不超过 3000ms。", style = MaterialTheme.typography.bodySmall)
+                Text("速度范围建议 95~105，裁剪建议每端不超过 3000ms。", style = MaterialTheme.typography.bodySmall)
 
                 OutlinedTextField(
                     value = state.dedupSpeedPercentDraft,
                     onValueChange = viewModel::updateDedupSpeedPercentDraft,
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text("速度微调（%）") },
-                    placeholder = { Text("100") },
+                    placeholder = { Text("98") },
                     singleLine = true,
                     enabled = !state.isDedupProcessing
                 )
@@ -529,7 +726,7 @@ private fun VideoDedupTabContent(
                     onValueChange = viewModel::updateDedupTrimStartMsDraft,
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text("起始裁剪（ms）") },
-                    placeholder = { Text("120") },
+                    placeholder = { Text("80") },
                     singleLine = true,
                     enabled = !state.isDedupProcessing
                 )
@@ -538,7 +735,25 @@ private fun VideoDedupTabContent(
                     onValueChange = viewModel::updateDedupTrimEndMsDraft,
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text("结尾裁剪（ms）") },
-                    placeholder = { Text("80") },
+                    placeholder = { Text("100") },
+                    singleLine = true,
+                    enabled = !state.isDedupProcessing
+                )
+                OutlinedTextField(
+                    value = state.dedupPtsJitterMsDraft,
+                    onValueChange = viewModel::updateDedupPtsJitterMsDraft,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("时间微扰（ms）") },
+                    placeholder = { Text("8") },
+                    singleLine = true,
+                    enabled = !state.isDedupProcessing
+                )
+                OutlinedTextField(
+                    value = state.dedupRandomTrimJitterMsDraft,
+                    onValueChange = viewModel::updateDedupRandomTrimJitterMsDraft,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("随机裁剪抖动（ms）") },
+                    placeholder = { Text("20") },
                     singleLine = true,
                     enabled = !state.isDedupProcessing
                 )
@@ -565,6 +780,27 @@ private fun VideoDedupTabContent(
                         enabled = !state.isDedupProcessing
                     )
                 }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("轨道顺序扰动（容器层）", style = MaterialTheme.typography.bodySmall)
+                    Switch(
+                        checked = state.dedupShuffleTrackOrderEnabled,
+                        onCheckedChange = viewModel::setDedupShuffleTrackOrderEnabled,
+                        enabled = !state.isDedupProcessing
+                    )
+                }
+                OutlinedTextField(
+                    value = state.dedupSeedDraft,
+                    onValueChange = viewModel::updateDedupSeedDraft,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("随机种子 Seed（可选）") },
+                    placeholder = { Text("留空自动生成；填同一 seed 可复现扰动") },
+                    singleLine = true,
+                    enabled = !state.isDedupProcessing
+                )
             }
         }
 
