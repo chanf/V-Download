@@ -686,6 +686,10 @@ class VideoDedupRepository {
         val sequenceItems = mutableListOf<EditedMediaItem>()
         val introDurationUs = ceil((introFrameCount * 1_000_000.0) / sourceFrameRate).toLong().coerceAtLeast(1L)
         val frameRateInt = sourceFrameRate.roundToLong().toInt().coerceIn(1, 240)
+        var overlayFirstPtsUs = -1L
+        var overlayLastPtsUs = -1L
+        var overlayCallbackCount = 0L
+        var overlayVisibleCount = 0L
 
         val sourceEditedItem = when {
             coverImageUri != null && introCoverMode == DedupIntroCoverMode.OVERLAY_FRAMES -> {
@@ -703,7 +707,17 @@ class VideoDedupRepository {
                     }
 
                     override fun getOverlaySettings(presentationTimeUs: Long): OverlaySettings {
-                        return if (presentationTimeUs <= introDurationUs) visibleSettings else hiddenSettings
+                        overlayCallbackCount += 1L
+                        if (overlayFirstPtsUs < 0L) {
+                            overlayFirstPtsUs = presentationTimeUs
+                        }
+                        overlayLastPtsUs = presentationTimeUs
+                        val relativePtsUs = (presentationTimeUs - overlayFirstPtsUs).coerceAtLeast(0L)
+                        val visible = relativePtsUs < introDurationUs
+                        if (visible) {
+                            overlayVisibleCount += 1L
+                        }
+                        return if (visible) visibleSettings else hiddenSettings
                     }
                 }
                 val overlayEffect = OverlayEffect(listOf(timedOverlay))
@@ -745,24 +759,33 @@ class VideoDedupRepository {
             }
         }
 
-        if (sequenceItems.size <= 1) {
-            logStep(trace, "片头片尾合成跳过", "sequenceSize=${sequenceItems.size}（无需合成）")
+        val usesImageIntro = coverImageUri != null && introCoverMode == DedupIntroCoverMode.INSERT_FRAMES
+        val usesOverlayIntro = coverImageUri != null && introCoverMode == DedupIntroCoverMode.OVERLAY_FRAMES
+        val usesImageEnding = endingType == DedupEndingType.IMAGE && endingMediaUri != null
+        val usesVideoEnding = endingType == DedupEndingType.VIDEO && endingMediaUri != null
+        val hasAnyCompositionEffect = usesImageIntro || usesOverlayIntro || usesImageEnding || usesVideoEnding
+
+        if (sequenceItems.size <= 1 && !hasAnyCompositionEffect) {
+            logStep(trace, "片头片尾合成跳过", "sequenceSize=${sequenceItems.size} hasAnyCompositionEffect=$hasAnyCompositionEffect")
             return
         }
 
         withContext(Dispatchers.Main) {
             suspendCancellableCoroutine { continuation ->
-                val usesImageIntro = coverImageUri != null && introCoverMode == DedupIntroCoverMode.INSERT_FRAMES
-                val usesOverlayIntro = coverImageUri != null && introCoverMode == DedupIntroCoverMode.OVERLAY_FRAMES
-                val usesImageEnding = endingType == DedupEndingType.IMAGE && endingMediaUri != null
-                val usesVideoEnding = endingType == DedupEndingType.VIDEO && endingMediaUri != null
                 val requiresReencode = usesImageIntro || usesOverlayIntro || usesImageEnding || usesVideoEnding
+                val overlayWindowRule = if (usesOverlayIntro) {
+                    "relativePtsUs < introDurationUs（relativePtsUs=presentationTimeUs-firstPresentationTimeUs）"
+                } else {
+                    "N/A"
+                }
                 // Media3 要求：当序列前段是无音轨素材（如图片），后段出现有音轨视频时，需要强制补音轨。
                 val forceAudioTrack = usesImageIntro
                 logStep(
                     trace,
                     "片头片尾合成开始",
-                    "sequence=${sequenceItems.size} introDurationUs=$introDurationUs reencode=$requiresReencode forceAudioTrack=$forceAudioTrack"
+                    "sequence=${sequenceItems.size} overlayMode=$usesOverlayIntro introFrameCount=$introFrameCount " +
+                        "fps=${String.format(Locale.US, "%.2f", sourceFrameRate)} introDurationUs=$introDurationUs " +
+                        "overlayWindowRule=$overlayWindowRule reencode=$requiresReencode forceAudioTrack=$forceAudioTrack"
                 )
                 val compositionBuilder = Composition.Builder(
                     EditedMediaItemSequence.Builder(sequenceItems)
@@ -782,12 +805,18 @@ class VideoDedupRepository {
                                 composition: Composition,
                                 exportResult: ExportResult
                             ) {
+                                val overlayStats = if (usesOverlayIntro) {
+                                    " overlayCallbacks=$overlayCallbackCount overlayVisible=$overlayVisibleCount " +
+                                        "overlayFirstPtsUs=$overlayFirstPtsUs overlayLastPtsUs=$overlayLastPtsUs"
+                                } else {
+                                    ""
+                                }
                                 logStep(
                                     trace,
                                     "片头片尾合成完成",
                                     "durationMs=${exportResult.durationMs} frameCount=${exportResult.videoFrameCount} " +
                                         "avgAudioBitrate=${exportResult.averageAudioBitrate} avgVideoBitrate=${exportResult.averageVideoBitrate} " +
-                                        "output=${outputFile.absolutePath}"
+                                        "output=${outputFile.absolutePath}$overlayStats"
                                 )
                                 if (continuation.isActive) {
                                     continuation.resume(Unit)

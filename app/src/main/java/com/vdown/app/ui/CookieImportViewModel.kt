@@ -5,6 +5,8 @@ import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.util.Log
 import android.util.Patterns
 import androidx.compose.runtime.getValue
@@ -52,6 +54,55 @@ private data class TranscriptAttemptResult(
     val notes: List<String> = emptyList()
 )
 
+private data class OverlayCoverValidation(
+    val isPngExtension: Boolean,
+    val hasAlphaChannel: Boolean?,
+    val hasTransparentPixels: Boolean?,
+    val hasVisiblePixels: Boolean?,
+    val decodeError: String? = null
+) {
+    val warningMessage: String?
+        get() = when {
+            !decodeError.isNullOrBlank() ->
+                "覆盖模式素材检测失败（$decodeError），将继续执行但可能遮挡底层视频。"
+            !isPngExtension ->
+                "覆盖模式建议使用带透明区域的 PNG。当前文件扩展名不是 .png，可能整帧遮挡底层视频。"
+            hasAlphaChannel == false ->
+                "覆盖模式建议使用透明 PNG。当前图片不含 Alpha 通道，可能整帧遮挡底层视频。"
+            hasTransparentPixels == false ->
+                "覆盖模式建议使用透明 PNG。当前图片未检测到透明像素，可能整帧遮挡底层视频。"
+            hasVisiblePixels == false ->
+                "覆盖模式素材检测到“全透明图”，没有可见覆盖内容，画面可能看不到任何效果。"
+            else -> null
+        }
+
+    fun diagnosticsLines(): List<String> {
+        val alphaText = when (hasAlphaChannel) {
+            true -> "是"
+            false -> "否"
+            null -> "未知"
+        }
+        val transparentText = when (hasTransparentPixels) {
+            true -> "是"
+            false -> "否"
+            null -> "未知"
+        }
+        val visibleText = when (hasVisiblePixels) {
+            true -> "是"
+            false -> "否"
+            null -> "未知"
+        }
+        val conclusion = warningMessage ?: "通过（建议项满足）"
+        return listOf(
+            "覆盖素材扩展名PNG = ${if (isPngExtension) "是" else "否"}",
+            "覆盖素材Alpha通道 = $alphaText",
+            "覆盖素材存在透明像素 = $transparentText",
+            "覆盖素材存在可见像素 = $visibleText",
+            "覆盖素材校验结论 = $conclusion"
+        )
+    }
+}
+
 enum class DedupPresetTemplate(
     val title: String,
     val speedPercent: Int,
@@ -61,6 +112,15 @@ enum class DedupPresetTemplate(
     val randomTrimJitterMs: Int,
     val shuffleTrackOrder: Boolean
 ) {
+    NONE(
+        title = "无",
+        speedPercent = 100,
+        trimStartMs = 0,
+        trimEndMs = 0,
+        ptsJitterMs = 0,
+        randomTrimJitterMs = 0,
+        shuffleTrackOrder = false
+    ),
     LIGHT(
         title = "轻度",
         speedPercent = 98,
@@ -126,8 +186,9 @@ data class CookieImportUiState(
     val dedupSeedDraft: String = "",
     val dedupCoverImageUri: Uri? = null,
     val dedupCoverImageName: String? = null,
+    val dedupCoverOverlayWarning: String? = null,
     val dedupIntroCoverMode: DedupIntroCoverMode = DedupIntroCoverMode.NONE,
-    val dedupIntroFrameCountDraft: String = "6",
+    val dedupIntroFrameCountDraft: String = "12",
     val dedupEndingType: DedupEndingType = DedupEndingType.NONE,
     val dedupEndingMediaUri: Uri? = null,
     val dedupEndingMediaName: String? = null,
@@ -513,11 +574,30 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun setDedupIntroCoverMode(mode: DedupIntroCoverMode) {
+        val snapshot = uiState
         uiState = uiState.copy(
             dedupIntroCoverMode = mode,
+            dedupCoverOverlayWarning = if (mode == DedupIntroCoverMode.OVERLAY_FRAMES) {
+                snapshot.dedupCoverOverlayWarning
+            } else {
+                null
+            },
             dedupErrorMessage = null
         )
         persistDedupFeatureConfigAsync()
+
+        if (mode == DedupIntroCoverMode.OVERLAY_FRAMES) {
+            val coverUri = snapshot.dedupCoverImageUri
+            val coverName = snapshot.dedupCoverImageName
+            if (coverUri != null) {
+                viewModelScope.launch {
+                    val overlayValidation = inspectOverlayCoverMaterial(coverUri, coverName)
+                    uiState = uiState.copy(
+                        dedupCoverOverlayWarning = overlayValidation.warningMessage
+                    )
+                }
+            }
+        }
     }
 
     fun updateDedupIntroFrameCountDraft(value: String) {
@@ -544,9 +624,16 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
             }.onSuccess { cached ->
                 val previousCoverUri = uiState.dedupCoverImageUri
                 deleteCachedCoverIfOwned(previousCoverUri, exceptPath = cached.path)
+                val overlayValidation = if (uiState.dedupIntroCoverMode == DedupIntroCoverMode.OVERLAY_FRAMES) {
+                    inspectOverlayCoverMaterial(cached, sourceName)
+                } else {
+                    null
+                }
+                val overlayWarning = overlayValidation?.warningMessage
                 uiState = uiState.copy(
                     dedupCoverImageUri = cached,
                     dedupCoverImageName = sourceName,
+                    dedupCoverOverlayWarning = overlayWarning,
                     dedupMessage = "封面已缓存，可用于片头插入或前帧覆盖。",
                     dedupErrorMessage = null
                 )
@@ -565,6 +652,7 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
         uiState = uiState.copy(
             dedupCoverImageUri = null,
             dedupCoverImageName = null,
+            dedupCoverOverlayWarning = null,
             dedupMessage = "已清除封面设置。",
             dedupErrorMessage = null
         )
@@ -717,8 +805,11 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
         ) ?: return
         val introCoverMode = uiState.dedupIntroCoverMode
         val coverImageUri = uiState.dedupCoverImageUri
+        val coverImageName = uiState.dedupCoverImageName
         val endingType = uiState.dedupEndingType
         val endingMediaUri = uiState.dedupEndingMediaUri
+        val randomSuffixEnabled = uiState.dedupRandomSuffixEnabled
+        val shuffleTrackOrderEnabled = uiState.dedupShuffleTrackOrderEnabled
         if (introCoverMode != DedupIntroCoverMode.NONE && coverImageUri == null) {
             uiState = uiState.copy(
                 dedupErrorMessage = "已启用片头模式，但未选择封面图片。",
@@ -751,11 +842,18 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
         val dedupPreset = DedupPresetTemplate.fromName(uiState.dedupPresetName)
 
         viewModelScope.launch {
+            val overlayValidation = if (introCoverMode == DedupIntroCoverMode.OVERLAY_FRAMES && coverImageUri != null) {
+                inspectOverlayCoverMaterial(coverImageUri, coverImageName)
+            } else {
+                null
+            }
+            val overlayValidationLines = overlayValidation?.diagnosticsLines().orEmpty()
             uiState = uiState.copy(
                 isDedupProcessing = true,
                 dedupProgress = 0,
                 dedupMessage = "正在执行视频去重...",
                 dedupErrorMessage = null,
+                dedupCoverOverlayWarning = overlayValidation?.warningMessage,
                 dedupDiagnostics = buildDedupDiagnostics(
                     phase = "开始去重",
                     videoUri = targetUri.toString(),
@@ -775,11 +873,11 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                         "片尾素材 = ${if (endingMediaUri != null) (uiState.dedupEndingMediaName ?: endingMediaUri.toString()) else "未设置"}",
                         "图片片尾时长(ms) = $endingImageDurationMs",
                         "输出前缀 = $outputPrefix",
-                        "随机后缀 = ${uiState.dedupRandomSuffixEnabled}",
-                        "轨道顺序扰动 = ${uiState.dedupShuffleTrackOrderEnabled}",
+                        "随机后缀 = $randomSuffixEnabled",
+                        "轨道顺序扰动 = $shuffleTrackOrderEnabled",
                         "模板 = ${dedupPreset.title}",
                         "输出目录 = DCIM/v-down"
-                    )
+                    ) + overlayValidationLines
                 )
             )
 
@@ -795,9 +893,9 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                         trimEndMs = trimEnd,
                         ptsJitterMs = ptsJitterMs,
                         randomTrimJitterMs = randomTrimJitterMs,
-                        shuffleTrackOrder = uiState.dedupShuffleTrackOrderEnabled,
+                        shuffleTrackOrder = shuffleTrackOrderEnabled,
                         outputPrefix = outputPrefix,
-                        randomSuffixEnabled = uiState.dedupRandomSuffixEnabled,
+                        randomSuffixEnabled = randomSuffixEnabled,
                         seed = dedupSeed,
                         coverImageUri = coverImageUri,
                         introCoverMode = introCoverMode,
@@ -819,6 +917,7 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                     dedupProgress = 100,
                     dedupMessage = "去重完成：${result.outputName}（约${durationMs}ms），已保存到 DCIM/v-down。",
                     dedupErrorMessage = null,
+                    dedupCoverOverlayWarning = overlayValidation?.warningMessage,
                     dedupDiagnostics = buildDedupDiagnostics(
                         phase = "去重成功",
                         videoUri = targetUri.toString(),
@@ -842,7 +941,7 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                             "覆盖模式是否生效 = ${if (result.overlayApplied) "是" else "否"}",
                             "片尾应用 = ${result.endingApplied}",
                             "策略 = ${result.strategySummary}"
-                        )
+                        ) + overlayValidationLines
                     ),
                     lastDedupVideoUri = result.outputUri,
                     lastDedupVideoName = result.outputName,
@@ -856,7 +955,7 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                     "dedup success input=$targetUri output=${result.outputUri} bytes=${result.bytesWritten}"
                 )
             }.onFailure { error ->
-                val dedupFailureContext = listOf(
+                val dedupFailureContext = mutableListOf(
                     "片头模式 = ${uiState.dedupIntroCoverMode.title}",
                     "片头帧数 = ${uiState.dedupIntroFrameCountDraft}",
                     "封面素材URI方案 = ${uiState.dedupCoverImageUri?.scheme ?: "N/A"}",
@@ -864,10 +963,12 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                     "片尾素材URI方案 = ${uiState.dedupEndingMediaUri?.scheme ?: "N/A"}",
                     "随机种子草稿 = ${uiState.dedupSeedDraft.ifBlank { "(自动生成)" }}"
                 )
+                dedupFailureContext += overlayValidationLines
                 uiState = uiState.copy(
                     isDedupProcessing = false,
                     dedupMessage = null,
                     dedupErrorMessage = error.message ?: "视频去重失败，请稍后重试。",
+                    dedupCoverOverlayWarning = overlayValidation?.warningMessage,
                     dedupDiagnostics = buildDedupDiagnostics(
                         phase = "去重失败",
                         videoUri = targetUri.toString(),
@@ -1866,6 +1967,7 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
             dedupCoverImageName = config.coverImageName
                 ?: coverUri?.lastPathSegment
                 ?: coverUri?.toString(),
+            dedupCoverOverlayWarning = null,
             dedupIntroCoverMode = introMode,
             dedupIntroFrameCountDraft = config.introFrameCount.toString(),
             dedupEndingType = endingType,
@@ -1873,6 +1975,12 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
             dedupEndingMediaName = config.endingMediaName,
             dedupEndingImageDurationMsDraft = config.endingImageDurationMs.toString()
         )
+        if (introMode == DedupIntroCoverMode.OVERLAY_FRAMES && coverUri != null) {
+            val overlayValidation = inspectOverlayCoverMaterial(coverUri, uiState.dedupCoverImageName)
+            uiState = uiState.copy(
+                dedupCoverOverlayWarning = overlayValidation.warningMessage
+            )
+        }
     }
 
     private fun persistDedupFeatureConfigAsync() {
@@ -1890,7 +1998,7 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
                 introFrameCount = snapshot.dedupIntroFrameCountDraft.trim()
                     .toIntOrNull()
                     ?.coerceIn(1, 60)
-                    ?: 6,
+                    ?: 12,
                 endingType = if (endingUri.isNullOrBlank()) DedupEndingType.NONE else snapshot.dedupEndingType,
                 endingMediaUri = endingUri,
                 endingMediaName = snapshot.dedupEndingMediaName,
@@ -1947,6 +2055,84 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
             }
         }
         uri.lastPathSegment ?: uri.toString()
+    }
+
+    private suspend fun inspectOverlayCoverMaterial(
+        coverUri: Uri,
+        coverName: String?
+    ): OverlayCoverValidation = withContext(Dispatchers.IO) {
+        val candidateName = coverName
+            ?.takeIf { it.isNotBlank() }
+            ?: coverUri.lastPathSegment
+            ?: ""
+        val extension = candidateName.substringAfterLast('.', "").lowercase(Locale.ROOT)
+        val isPngExtension = extension == "png"
+
+        var bitmap: Bitmap? = null
+        try {
+            bitmap = getApplication<Application>().contentResolver.openInputStream(coverUri)?.use { input ->
+                BitmapFactory.decodeStream(input)
+            } ?: return@withContext OverlayCoverValidation(
+                isPngExtension = isPngExtension,
+                hasAlphaChannel = null,
+                hasTransparentPixels = null,
+                hasVisiblePixels = null,
+                decodeError = "无法解码图片"
+            )
+
+            val hasAlphaChannel = bitmap.hasAlpha()
+            val (hasTransparentPixels, hasVisiblePixels) = if (hasAlphaChannel) {
+                inspectBitmapAlpha(bitmap)
+            } else {
+                false to true
+            }
+            OverlayCoverValidation(
+                isPngExtension = isPngExtension,
+                hasAlphaChannel = hasAlphaChannel,
+                hasTransparentPixels = hasTransparentPixels,
+                hasVisiblePixels = hasVisiblePixels
+            )
+        } catch (error: Exception) {
+            OverlayCoverValidation(
+                isPngExtension = isPngExtension,
+                hasAlphaChannel = null,
+                hasTransparentPixels = null,
+                hasVisiblePixels = null,
+                decodeError = error.message ?: "未知错误"
+            )
+        } finally {
+            runCatching { bitmap?.recycle() }
+        }
+    }
+
+    private fun inspectBitmapAlpha(bitmap: Bitmap): Pair<Boolean, Boolean> {
+        val width = bitmap.width
+        val height = bitmap.height
+        if (width <= 0 || height <= 0) return false to false
+
+        val stepX = (width / 96).coerceAtLeast(1)
+        val stepY = (height / 96).coerceAtLeast(1)
+        var hasTransparentPixel = false
+        var hasVisiblePixel = false
+        var y = 0
+        while (y < height) {
+            var x = 0
+            while (x < width) {
+                val alpha = (bitmap.getPixel(x, y) ushr 24) and 0xFF
+                if (alpha < 255) hasTransparentPixel = true
+                if (alpha > 0) hasVisiblePixel = true
+                if (hasTransparentPixel && hasVisiblePixel) {
+                    return true to true
+                }
+                x += stepX
+            }
+            y += stepY
+        }
+
+        val lastAlpha = (bitmap.getPixel(width - 1, height - 1) ushr 24) and 0xFF
+        if (lastAlpha < 255) hasTransparentPixel = true
+        if (lastAlpha > 0) hasVisiblePixel = true
+        return hasTransparentPixel to hasVisiblePixel
     }
 
     private fun normalizeUrl(raw: String): String? {
@@ -2066,6 +2252,7 @@ class CookieImportViewModel(application: Application) : AndroidViewModel(applica
         lines += "随机种子草稿(seed) = ${uiState.dedupSeedDraft.ifBlank { "(自动生成)" }}"
         lines += "封面图片 = ${uiState.dedupCoverImageName ?: "(未设置)"}"
         lines += "封面图片URI = ${uiState.dedupCoverImageUri?.toString() ?: "(未设置)"}"
+        lines += "覆盖素材警告 = ${uiState.dedupCoverOverlayWarning ?: "(无)"}"
         lines += "片头模式 = ${uiState.dedupIntroCoverMode.title}"
         lines += "片头帧数草稿 = ${uiState.dedupIntroFrameCountDraft}"
         lines += "片尾类型 = ${uiState.dedupEndingType.title}"

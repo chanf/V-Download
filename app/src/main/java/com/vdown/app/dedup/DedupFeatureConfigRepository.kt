@@ -31,7 +31,7 @@ data class DedupFeatureConfig(
     val coverImageCachePath: String? = null,
     val coverImageName: String? = null,
     val introCoverMode: DedupIntroCoverMode = DedupIntroCoverMode.NONE,
-    val introFrameCount: Int = 6,
+    val introFrameCount: Int = 12,
     val endingType: DedupEndingType = DedupEndingType.NONE,
     val endingMediaUri: String? = null,
     val endingMediaName: String? = null,
@@ -51,7 +51,7 @@ class DedupFeatureConfigRepository(context: Context) {
             val hasIntroFrameCount = json.has("introFrameCount")
             val legacyCoverDurationMs = json.optInt("coverImageDurationMs", 1200)
             val introFrameCount = if (hasIntroFrameCount) {
-                json.optInt("introFrameCount", 6).coerceIn(1, 60)
+                json.optInt("introFrameCount", 12).coerceIn(1, 60)
             } else {
                 ((legacyCoverDurationMs / 1000.0) * 30.0).toInt().coerceIn(1, 60)
             }

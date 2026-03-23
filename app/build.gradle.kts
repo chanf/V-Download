@@ -28,8 +28,8 @@ android {
         applicationId = "com.vdown.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 29
-        versionName = "0.1.28"
+        versionCode = 33
+        versionName = "0.1.32"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

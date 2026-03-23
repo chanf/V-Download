@@ -52,6 +52,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -424,6 +425,16 @@ private fun VideoDedupTabContent(
     val currentDedupPreset = remember(state.dedupPresetName) {
         DedupPresetTemplate.fromName(state.dedupPresetName)
     }
+    val introFrameLabel = when (state.dedupIntroCoverMode) {
+        DedupIntroCoverMode.OVERLAY_FRAMES -> "覆盖帧数（1~60）"
+        DedupIntroCoverMode.INSERT_FRAMES -> "片头帧数（1~60）"
+        DedupIntroCoverMode.NONE -> "片头/覆盖帧数（1~60）"
+    }
+    val introFrameHint = when (state.dedupIntroCoverMode) {
+        DedupIntroCoverMode.OVERLAY_FRAMES -> "默认 12 帧，可按需要放慢或加快覆盖节奏。"
+        DedupIntroCoverMode.INSERT_FRAMES -> "默认 12 帧，可按需要调整片头停留时长。"
+        DedupIntroCoverMode.NONE -> "默认 12 帧，启用片头模式后生效。"
+    }
 
     val openVideoLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -561,6 +572,20 @@ private fun VideoDedupTabContent(
             ) {
                 Text("片头封面", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
                 Text("封面会被缓存到应用内，可用于“插入封面帧”或“覆盖前若干帧”模式。", style = MaterialTheme.typography.bodySmall)
+                if (state.dedupIntroCoverMode == DedupIntroCoverMode.OVERLAY_FRAMES) {
+                    Text(
+                        "覆盖模式说明：会将封面图叠加在前若干帧上层，建议使用带透明区域的 PNG，否则可能遮挡底层视频。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFB26A00)
+                    )
+                }
+                state.dedupCoverOverlayWarning?.let { warning ->
+                    Text(
+                        text = "警告：$warning",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFB26A00)
+                    )
+                }
                 ExposedDropdownMenuBox(
                     expanded = introCoverModeMenuExpanded,
                     onExpandedChange = { introCoverModeMenuExpanded = !introCoverModeMenuExpanded }
@@ -613,8 +638,9 @@ private fun VideoDedupTabContent(
                     value = state.dedupIntroFrameCountDraft,
                     onValueChange = viewModel::updateDedupIntroFrameCountDraft,
                     modifier = Modifier.fillMaxWidth(),
-                    label = { Text("片头帧数（1~60）") },
-                    placeholder = { Text("6") },
+                    label = { Text(introFrameLabel) },
+                    placeholder = { Text("12") },
+                    supportingText = { Text(introFrameHint) },
                     singleLine = true,
                     enabled = !state.isDedupProcessing
                 )
