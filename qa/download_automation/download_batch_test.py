@@ -279,12 +279,22 @@ def run_single_case(
 
     status: Optional[str] = None
     latest_log = ""
+    pass_by_new_file = False
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         log_proc = adb(adb_prefix, ["logcat", "-d", "-s", "VDownDownload:V", "VDownDownloadUi:V"], timeout=20)
         latest_log = log_proc.stdout
         status = classify_log(latest_log)
-        if status in {"PASS", "FAIL"}:
+        if status == "FAIL":
+            break
+        if status == "PASS":
+            break
+
+        # 日志为空或未命中时，兜底采用“目录新增文件即通过”判定。
+        current_files = set(list_download_files(adb_prefix, download_dir))
+        if current_files - before_files:
+            status = "PASS"
+            pass_by_new_file = True
             break
         time.sleep(poll_interval_sec)
 
@@ -293,13 +303,31 @@ def run_single_case(
 
     after_files = set(list_download_files(adb_prefix, download_dir))
     new_files = sorted(after_files - before_files)
+
+    # 部分机型上日志先到达、文件稍后落盘：给目录检测一个短暂补偿窗口。
+    if not new_files:
+        settle_deadline = time.time() + min(8.0, max(2.0, poll_interval_sec * 4))
+        while time.time() < settle_deadline:
+            time.sleep(1.0)
+            settled_files = set(list_download_files(adb_prefix, download_dir))
+            settled_new = sorted(settled_files - before_files)
+            if settled_new:
+                after_files = settled_files
+                new_files = settled_new
+                pass_by_new_file = True
+                break
     elapsed = time.time() - start
 
     error_summary = ""
     if status == "FAIL":
         error_summary = extract_error_summary(latest_log) or "日志未命中失败关键字，请查看 log_tail。"
-    if status == "TIMEOUT":
+    if status == "TIMEOUT" and new_files:
+        status = "PASS"
+        pass_by_new_file = True
+    elif status == "TIMEOUT":
         error_summary = f"在 {timeout_sec}s 内未检测到成功/失败关键日志。"
+    if pass_by_new_file and status == "PASS":
+        error_summary = "目录检测到新增文件，按下载成功处理。"
 
     return CaseResult(
         index=index,

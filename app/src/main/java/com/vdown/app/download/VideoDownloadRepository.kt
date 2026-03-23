@@ -16,6 +16,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
@@ -25,6 +26,7 @@ import java.net.URL
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.zip.GZIPInputStream
 
 private const val DOWNLOAD_RELATIVE_PATH = "DCIM/v-down"
 private const val DEFAULT_MIME_TYPE = "video/mp4"
@@ -41,6 +43,8 @@ private const val ANDROID_CHROME_UA =
     "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 private const val DESKTOP_CHROME_UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+private const val TIKTOK_ANDROID_APP_UA =
+    "com.ss.android.ugc.trill/2613 (Linux; U; Android 13; en_US; Pixel 5; Build/TQ3A.230805.001)"
 private val INSTAGRAM_OG_VIDEO_PATTERNS = listOf(
     Regex(
         """<meta[^>]*property=["']og:video(?::secure_url)?["'][^>]*content=["']([^"']+)["']""",
@@ -57,9 +61,9 @@ private val INSTAGRAM_VIDEO_URL_PATTERNS = listOf(
     Regex("""['"]video_url['"]\s*:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
 )
 private val TIKTOK_VIDEO_URL_PATTERNS = listOf(
-    Regex("""\\\"(?:downloadAddr|playAddr|playUrl)\\\"\s*:\s*\\\"(.*?)\\\"""", RegexOption.IGNORE_CASE),
-    Regex(""""(?:downloadAddr|playAddr|playUrl)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE),
-    Regex("""['"](?:downloadAddr|playAddr|playUrl)['"]\s*:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
+    Regex("""\\\"(?:downloadAddr|playAddr|playUrl|download_addr|play_addr|video_url)\\\"\s*:\s*\\\"(.*?)\\\"""", RegexOption.IGNORE_CASE),
+    Regex(""""(?:downloadAddr|playAddr|playUrl|download_addr|play_addr|video_url)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE),
+    Regex("""['"](?:downloadAddr|playAddr|playUrl|download_addr|play_addr|video_url)['"]\s*:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
 )
 private val TIKWM_VIDEO_URL_PATTERNS = listOf(
     Regex("""\\\"(?:play|wmplay|hdplay)\\\"\s*:\s*\\\"(.*?)\\\"""", RegexOption.IGNORE_CASE),
@@ -103,7 +107,10 @@ private val X_VIDEO_VARIANT_PATTERNS = listOf(
 )
 private val HTTP_URL_PATTERN = Regex("""https?://[^"'<>\s\\]+""", RegexOption.IGNORE_CASE)
 private val STRICT_HTTP_URL_PATTERN = Regex("""https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+""", RegexOption.IGNORE_CASE)
-private val TIKTOK_VIDEO_ID_PATTERN = Regex("""(?:/video/|/v/)(\d{6,30})""", RegexOption.IGNORE_CASE)
+private val TIKTOK_VIDEO_ID_PATTERNS = listOf(
+    Regex("""(?:/video/|/v/|/embed/v2/)(\d{6,30})""", RegexOption.IGNORE_CASE),
+    Regex("""(?:item_id|itemId|aweme_id|share_item_id|modal_id)["=: ]+"?(\d{6,30})""", RegexOption.IGNORE_CASE)
+)
 private val DOUYIN_ITEM_ID_PATTERNS = listOf(
     Regex("""(?:/video/|/share/video/)(\d{6,30})""", RegexOption.IGNORE_CASE),
     Regex("""(?:/xg/video/)(\d{6,30})""", RegexOption.IGNORE_CASE),
@@ -134,6 +141,17 @@ private data class DownloadOpenResult(
     val finalUrl: String,
     val responseMimeType: String,
     val contentLength: Long
+)
+
+private data class TikTokPageParseResult(
+    val videoUrl: String?,
+    val discoveredItemId: String?,
+    val restriction: TikTokRestrictionInfo?
+)
+
+private data class TikTokRestrictionInfo(
+    val statusCode: Int,
+    val statusMsg: String?
 )
 
 class VideoDownloadRepository(
@@ -847,21 +865,63 @@ class VideoDownloadRepository(
     }
 
     private suspend fun resolveTikTokSourceUrl(source: String): String {
-        val candidates = linkedSetOf(source)
-        extractTikTokVideoId(source)?.let { itemId ->
-            candidates += "https://www.tiktok.com/embed/v2/$itemId"
-            candidates += "https://m.tiktok.com/v/$itemId.html"
-        }
+        val pageCandidates = linkedSetOf(source)
+        var discoveredItemId = extractTikTokVideoId(source)
+        var restrictionInfo: TikTokRestrictionInfo? = null
 
-        candidates.forEach { pageUrl ->
-            val page = fetchTikTokPage(pageUrl)
-            val resolved = extractTikTokVideoUrlFromPage(page)
-            if (!resolved.isNullOrBlank()) {
-                return resolved
+        val redirectedSource = runCatching {
+            resolveFinalRedirectUrl(
+                pageUrl = source,
+                userAgent = ANDROID_CHROME_UA,
+                referer = "https://www.tiktok.com/"
+            )
+        }.getOrNull()
+        if (!redirectedSource.isNullOrBlank()) {
+            pageCandidates += redirectedSource
+            if (discoveredItemId.isNullOrBlank()) {
+                discoveredItemId = extractTikTokVideoId(redirectedSource)
             }
         }
 
-        resolveTikTokViaTikwmApi(source)?.let { return it }
+        discoveredItemId?.let { itemId ->
+            pageCandidates += "https://www.tiktok.com/@i/video/$itemId"
+            pageCandidates += "https://www.tiktok.com/share/video/$itemId"
+            pageCandidates += "https://m.tiktok.com/v/$itemId.html"
+        }
+
+        pageCandidates.forEach { pageUrl ->
+            val parsed = parseTikTokPageCandidate(pageUrl)
+            if (!parsed.videoUrl.isNullOrBlank()) {
+                return parsed.videoUrl
+            }
+            if (discoveredItemId.isNullOrBlank()) {
+                discoveredItemId = parsed.discoveredItemId
+            }
+            if (restrictionInfo == null && parsed.restriction != null) {
+                restrictionInfo = parsed.restriction
+            }
+        }
+
+        val itemIdForFallback = discoveredItemId
+        if (!itemIdForFallback.isNullOrBlank()) {
+            resolveTikTokViaFeedApi(itemIdForFallback)?.let { return it }
+        }
+
+        val tikwmCandidates = linkedSetOf(source)
+        if (!redirectedSource.isNullOrBlank()) {
+            tikwmCandidates += redirectedSource
+        }
+        discoveredItemId?.let { itemId ->
+            tikwmCandidates += "https://www.tiktok.com/@i/video/$itemId"
+            tikwmCandidates += "https://www.tiktok.com/share/video/$itemId"
+        }
+        tikwmCandidates.forEach { candidate ->
+            resolveTikTokViaTikwmApi(candidate)?.let { return it }
+        }
+
+        restrictionInfo?.let { info ->
+            throw IllegalStateException(buildTikTokRestrictionMessage(info))
+        }
 
         throw IllegalStateException(
             "下载失败：TikTok 页面未解析到视频直链。请确认链接可公开访问，或导入可用的 TikTok Cookies 后重试。"
@@ -1236,6 +1296,228 @@ class VideoDownloadRepository(
             referer = "https://x.com/",
             accept = "application/json,text/plain,*/*"
         )
+    }
+
+    private suspend fun parseTikTokPageCandidate(pageUrl: String): TikTokPageParseResult {
+        safeLogInfo("tiktok resolve fetch page=$pageUrl")
+        val page = fetchTikTokPage(pageUrl)
+        safeLogInfo("tiktok resolve fetched page bytes=${page.length} from=$pageUrl")
+        return TikTokPageParseResult(
+            videoUrl = extractTikTokVideoUrlFromPage(page),
+            discoveredItemId = extractTikTokVideoId(page),
+            restriction = extractTikTokRestrictionInfo(page)
+        )
+    }
+
+    private fun buildTikTokRestrictionMessage(info: TikTokRestrictionInfo): String {
+        val statusSuffix = info.statusMsg
+            ?.takeIf { it.isNotBlank() }
+            ?.let { "，$it" }
+            .orEmpty()
+        return "下载失败：TikTok 视频当前不可下载（状态 ${info.statusCode}$statusSuffix）。通常是作者状态、审核中或区域限制导致，请稍后重试或更换链接。"
+    }
+
+    private fun extractTikTokRestrictionInfo(content: String): TikTokRestrictionInfo? {
+        val normalized = normalizeEscapedContent(content)
+        val scopeContent = Regex(
+            """<script[^>]*id=["']__UNIVERSAL_DATA_FOR_REHYDRATION__["'][^>]*>(.*?)</script>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        ).find(normalized)
+            ?.groupValues
+            ?.getOrNull(1)
+            .orEmpty()
+            .ifBlank { normalized }
+
+        val detailCode = Regex(
+            """["']webapp\.video-detail["']\s*:\s*\{.*?["']statusCode["']\s*:\s*(\d{3,6})""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        ).find(scopeContent)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+        val statusCode = detailCode
+            ?: Regex("""["']statusCode["']\s*:\s*(\d{3,6})""", RegexOption.IGNORE_CASE)
+                .find(scopeContent)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+
+        if (statusCode == null || statusCode == 0) return null
+
+        val detailMsg = Regex(
+            """["']webapp\.video-detail["']\s*:\s*\{.*?["']statusMsg["']\s*:\s*["']([^"']*)["']""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        ).find(scopeContent)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim()
+        val statusMsg = detailMsg
+            ?: Regex("""["']statusMsg["']\s*:\s*["']([^"']*)["']""", RegexOption.IGNORE_CASE)
+                .find(scopeContent)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.trim()
+
+        return TikTokRestrictionInfo(
+            statusCode = statusCode,
+            statusMsg = statusMsg?.takeIf { it.isNotBlank() }
+        )
+    }
+
+    private suspend fun resolveTikTokViaFeedApi(itemId: String): String? {
+        repeat(2) { attempt ->
+            val body = fetchTikTokFeedViaOptions(itemId)
+            if (body.isBlank()) {
+                return@repeat
+            }
+
+            extractTikTokVideoUrlFromFeedBody(body, itemId)?.let { resolved ->
+                safeLogInfo("tiktok resolve parsed feed direct=$resolved itemId=$itemId attempt=${attempt + 1}")
+                return resolved
+            }
+        }
+
+        return null
+    }
+
+    private suspend fun fetchTikTokFeedViaOptions(itemId: String): String {
+        val now = System.currentTimeMillis()
+        val apiUrl = buildString {
+            append("https://api16-normal-useast5.us.tiktokv.com/aweme/v1/feed/?")
+            append("aweme_id=").append(itemId)
+            append("&version_name=26.1.3")
+            append("&version_code=2613")
+            append("&build_number=26.1.3")
+            append("&manifest_version_code=2613")
+            append("&update_version_code=2613")
+            append("&openudid=1234567890abcdef")
+            append("&uuid=1234567890123456")
+            append("&_rticket=").append(now)
+            append("&ts=").append(now / 1000)
+            append("&device_brand=Google")
+            append("&device_type=Pixel%205")
+            append("&device_platform=android")
+            append("&resolution=1080*1920")
+            append("&dpi=420")
+            append("&os_version=13")
+            append("&os_api=33")
+            append("&carrier_region=US")
+            append("&sys_region=US")
+            append("&region=US")
+            append("&app_name=musical_ly")
+            append("&app_type=normal")
+            append("&channel=googleplay")
+            append("&mcc_mnc=310260")
+            append("&is_my_cn=0")
+            append("&ac=wifi")
+            append("&ssmix=a")
+            append("&as=a1qwert123")
+            append("&cp=cbfhckdckkde1")
+            append("&aid=1233")
+        }
+        safeLogInfo("tiktok resolve fetch feed api itemId=$itemId")
+
+        val connection = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
+            instanceFollowRedirects = true
+            requestMethod = "OPTIONS"
+            connectTimeout = 20_000
+            readTimeout = 30_000
+            setRequestProperty("User-Agent", TIKTOK_ANDROID_APP_UA)
+            setRequestProperty("Accept", "*/*")
+            setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+            setRequestProperty("Accept-Encoding", "identity")
+            setRequestProperty("Referer", "https://www.tiktok.com/")
+        }
+
+        return try {
+            val code = connection.responseCode
+            val stream = if (code in 200..299) {
+                connection.inputStream
+            } else {
+                connection.errorStream ?: return ""
+            }
+            val raw = stream.use { it.readBytes() }
+            val decoded = decodeGzipBodyIfNeeded(raw)
+            safeLogInfo(
+                "tiktok resolve fetched feed api bytesRaw=${raw.size} bytesDecoded=${decoded.length} itemId=$itemId code=$code"
+            )
+            decoded
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun decodeGzipBodyIfNeeded(raw: ByteArray): String {
+        if (raw.isEmpty()) return ""
+        val isGzip = raw.size >= 2 &&
+            raw[0] == 0x1f.toByte() &&
+            raw[1] == 0x8b.toByte()
+        if (!isGzip) {
+            return raw.toString(StandardCharsets.UTF_8)
+        }
+        return runCatching {
+            GZIPInputStream(ByteArrayInputStream(raw)).bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
+        }.getOrElse {
+            raw.toString(StandardCharsets.UTF_8)
+        }
+    }
+
+    private fun extractTikTokVideoUrlFromFeedBody(feedBody: String, itemId: String): String? {
+        val awemeObject = extractJsonObjectContaining(
+            content = feedBody,
+            anchor = "\"aweme_id\":\"$itemId\""
+        ) ?: return null
+        return extractTikTokVideoUrlFromPage(awemeObject)
+    }
+
+    private fun extractJsonObjectContaining(content: String, anchor: String): String? {
+        val anchorIndex = content.indexOf(anchor)
+        if (anchorIndex < 0) return null
+
+        var left = content.lastIndexOf('{', anchorIndex)
+        while (left >= 0) {
+            val right = findMatchingJsonBrace(content, left)
+            if (right >= anchorIndex) {
+                return content.substring(left, right + 1)
+            }
+            left = content.lastIndexOf('{', left - 1)
+        }
+        return null
+    }
+
+    private fun findMatchingJsonBrace(content: String, leftBraceIndex: Int): Int {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for (index in leftBraceIndex until content.length) {
+            val char = content[index]
+            if (inString) {
+                if (escaped) {
+                    escaped = false
+                    continue
+                }
+                if (char == '\\') {
+                    escaped = true
+                    continue
+                }
+                if (char == '"') {
+                    inString = false
+                }
+                continue
+            }
+
+            when (char) {
+                '"' -> inString = true
+                '{' -> depth += 1
+                '}' -> {
+                    depth -= 1
+                    if (depth == 0) {
+                        return index
+                    }
+                }
+            }
+        }
+        return -1
     }
 
     private suspend fun resolveTikTokViaTikwmApi(source: String): String? {
@@ -2588,7 +2870,13 @@ class VideoDownloadRepository(
     }
 
     private fun extractTikTokVideoId(text: String): String? {
-        return TIKTOK_VIDEO_ID_PATTERN.find(text)?.groupValues?.getOrNull(1)
+        for (pattern in TIKTOK_VIDEO_ID_PATTERNS) {
+            val match = pattern.find(text)?.groupValues?.getOrNull(1)
+            if (!match.isNullOrBlank()) {
+                return match
+            }
+        }
+        return null
     }
 
     private fun extractDouyinItemId(text: String): String? {
