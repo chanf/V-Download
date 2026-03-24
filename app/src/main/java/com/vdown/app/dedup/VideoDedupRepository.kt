@@ -58,6 +58,14 @@ private data class DedupTraceContext(
     var step: Int = 0
 )
 
+private data class VideoLayout(
+    val rawWidth: Int,
+    val rawHeight: Int,
+    val rotationDegrees: Int,
+    val displayWidth: Int,
+    val displayHeight: Int
+)
+
 data class VideoDedupRequest(
     val sourceVideoUri: Uri,
     val sourceVideoName: String?,
@@ -585,23 +593,78 @@ class VideoDedupRepository {
         }
     }
 
-    private fun resolveVideoDimensions(filePath: String): Pair<Int, Int> {
+    private fun resolveVideoLayout(filePath: String): VideoLayout {
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(filePath)
-            val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+            val rawWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
                 ?.toIntOrNull()
                 ?.takeIf { it > 0 }
                 ?: 720
-            val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+            val rawHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
                 ?.toIntOrNull()
                 ?.takeIf { it > 0 }
                 ?: 1280
-            width to height
+            val rotationDegrees = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                ?.toIntOrNull()
+                ?.let { ((it % 360) + 360) % 360 }
+                ?: 0
+            val swapped = rotationDegrees == 90 || rotationDegrees == 270
+            val displayWidth = if (swapped) rawHeight else rawWidth
+            val displayHeight = if (swapped) rawWidth else rawHeight
+            VideoLayout(
+                rawWidth = rawWidth,
+                rawHeight = rawHeight,
+                rotationDegrees = rotationDegrees,
+                displayWidth = displayWidth.coerceAtLeast(1),
+                displayHeight = displayHeight.coerceAtLeast(1)
+            )
         } catch (_: Exception) {
-            720 to 1280
+            VideoLayout(
+                rawWidth = 720,
+                rawHeight = 1280,
+                rotationDegrees = 0,
+                displayWidth = 720,
+                displayHeight = 1280
+            )
         } finally {
             runCatching { retriever.release() }
+        }
+    }
+
+    private fun normalizeImageToVideoLayout(
+        context: Context,
+        sourceImageUri: Uri,
+        targetWidth: Int,
+        targetHeight: Int,
+        prefix: String,
+        trace: DedupTraceContext
+    ): Uri {
+        val bitmap = decodeCoverBitmap(
+            context = context,
+            imageUri = sourceImageUri,
+            targetWidth = targetWidth,
+            targetHeight = targetHeight
+        )
+        val tempFile = File.createTempFile(prefix, ".png", context.cacheDir)
+        return try {
+            tempFile.outputStream().use { output ->
+                if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                    throw IllegalStateException("去重失败：图片归一化写入失败")
+                }
+                output.flush()
+            }
+            logStep(
+                trace,
+                "图片素材归一化完成",
+                "source=${describeUri(sourceImageUri)} target=${tempFile.absolutePath} targetSize=${targetWidth}x${targetHeight}"
+            )
+            Uri.fromFile(tempFile)
+        } catch (error: Exception) {
+            runCatching { tempFile.delete() }
+            throw error
+        } finally {
+            runCatching { bitmap.recycle() }
         }
     }
 
@@ -675,203 +738,245 @@ class VideoDedupRepository {
         endingImageDurationMs: Int,
         trace: DedupTraceContext
     ) {
-        logStep(
-            trace,
-            "片头片尾合成准备",
-            "source=${sourceVideoFile.absolutePath} output=${outputFile.absolutePath} introMode=${introCoverMode.name} " +
-                "introFrames=$introFrameCount introDurationMs=$introDurationMs sourceFps=${String.format(Locale.US, "%.2f", sourceFrameRate)} " +
-                "endingType=${endingType.name} endingUri=${describeUri(endingMediaUri)} coverUri=${describeUri(coverImageUri)}"
-        )
-        val sourceMediaItem = MediaItem.fromUri(Uri.fromFile(sourceVideoFile))
-        val sequenceItems = mutableListOf<EditedMediaItem>()
-        val introDurationUs = ceil((introFrameCount * 1_000_000.0) / sourceFrameRate).toLong().coerceAtLeast(1L)
-        val frameRateInt = sourceFrameRate.roundToLong().toInt().coerceIn(1, 240)
-        var overlayFirstPtsUs = -1L
-        var overlayLastPtsUs = -1L
-        var overlayCallbackCount = 0L
-        var overlayVisibleCount = 0L
-
-        val sourceEditedItem = when {
-            coverImageUri != null && introCoverMode == DedupIntroCoverMode.OVERLAY_FRAMES -> {
-                val sourceSize = resolveVideoDimensions(sourceVideoFile.absolutePath)
-                val coverBitmap = decodeCoverBitmap(context, coverImageUri, sourceSize.first, sourceSize.second)
-                val visibleSettings = OverlaySettings.Builder()
-                    .setAlphaScale(1f)
-                    .build()
-                val hiddenSettings = OverlaySettings.Builder()
-                    .setAlphaScale(0f)
-                    .build()
-                val timedOverlay = object : BitmapOverlay() {
-                    override fun getBitmap(presentationTimeUs: Long): Bitmap {
-                        return coverBitmap
-                    }
-
-                    override fun getOverlaySettings(presentationTimeUs: Long): OverlaySettings {
-                        overlayCallbackCount += 1L
-                        if (overlayFirstPtsUs < 0L) {
-                            overlayFirstPtsUs = presentationTimeUs
-                        }
-                        overlayLastPtsUs = presentationTimeUs
-                        val relativePtsUs = (presentationTimeUs - overlayFirstPtsUs).coerceAtLeast(0L)
-                        val visible = relativePtsUs < introDurationUs
-                        if (visible) {
-                            overlayVisibleCount += 1L
-                        }
-                        return if (visible) visibleSettings else hiddenSettings
-                    }
-                }
-                val overlayEffect = OverlayEffect(listOf(timedOverlay))
-                val effects = Effects(emptyList(), listOf(overlayEffect))
-                EditedMediaItem.Builder(sourceMediaItem)
-                    .setEffects(effects)
-                    .build()
-            }
-
-            else -> EditedMediaItem.Builder(sourceMediaItem).build()
-        }
-
-        if (coverImageUri != null && introCoverMode == DedupIntroCoverMode.INSERT_FRAMES) {
-            val introItem = MediaItem.Builder()
-                .setUri(coverImageUri)
-                .setImageDurationMs(introDurationMs)
-                .build()
-            sequenceItems += EditedMediaItem.Builder(introItem)
-                .setFrameRate(frameRateInt)
-                .build()
-        }
-
-        sequenceItems += sourceEditedItem
-
-        when {
-            endingType == DedupEndingType.IMAGE && endingMediaUri != null -> {
-                val endingImageItem = MediaItem.Builder()
-                    .setUri(endingMediaUri)
-                    .setImageDurationMs(endingImageDurationMs.toLong())
-                    .build()
-                sequenceItems += EditedMediaItem.Builder(endingImageItem)
-                    .setFrameRate(30)
-                    .build()
-            }
-
-            endingType == DedupEndingType.VIDEO && endingMediaUri != null -> {
-                val endingVideoItem = MediaItem.fromUri(endingMediaUri)
-                sequenceItems += EditedMediaItem.Builder(endingVideoItem).build()
-            }
-        }
-
-        val usesImageIntro = coverImageUri != null && introCoverMode == DedupIntroCoverMode.INSERT_FRAMES
-        val usesOverlayIntro = coverImageUri != null && introCoverMode == DedupIntroCoverMode.OVERLAY_FRAMES
-        val usesImageEnding = endingType == DedupEndingType.IMAGE && endingMediaUri != null
-        val usesVideoEnding = endingType == DedupEndingType.VIDEO && endingMediaUri != null
-        val hasAnyCompositionEffect = usesImageIntro || usesOverlayIntro || usesImageEnding || usesVideoEnding
-
-        if (sequenceItems.size <= 1 && !hasAnyCompositionEffect) {
-            logStep(trace, "片头片尾合成跳过", "sequenceSize=${sequenceItems.size} hasAnyCompositionEffect=$hasAnyCompositionEffect")
-            return
-        }
-
-        withContext(Dispatchers.Main) {
-            suspendCancellableCoroutine { continuation ->
-                val requiresReencode = usesImageIntro || usesOverlayIntro || usesImageEnding || usesVideoEnding
-                val overlayWindowRule = if (usesOverlayIntro) {
-                    "relativePtsUs < introDurationUs（relativePtsUs=presentationTimeUs-firstPresentationTimeUs）"
-                } else {
-                    "N/A"
-                }
-                // Media3 要求：当序列前段是无音轨素材（如图片），后段出现有音轨视频时，需要强制补音轨。
-                val forceAudioTrack = usesImageIntro
-                logStep(
-                    trace,
-                    "片头片尾合成开始",
-                    "sequence=${sequenceItems.size} overlayMode=$usesOverlayIntro introFrameCount=$introFrameCount " +
-                        "fps=${String.format(Locale.US, "%.2f", sourceFrameRate)} introDurationUs=$introDurationUs " +
-                        "overlayWindowRule=$overlayWindowRule reencode=$requiresReencode forceAudioTrack=$forceAudioTrack"
+        var normalizedIntroImageUri: Uri? = null
+        var normalizedEndingImageUri: Uri? = null
+        var normalizedIntroImageFile: File? = null
+        var normalizedEndingImageFile: File? = null
+        try {
+            logStep(
+                trace,
+                "片头片尾合成准备",
+                "source=${sourceVideoFile.absolutePath} output=${outputFile.absolutePath} introMode=${introCoverMode.name} " +
+                    "introFrames=$introFrameCount introDurationMs=$introDurationMs sourceFps=${String.format(Locale.US, "%.2f", sourceFrameRate)} " +
+                    "endingType=${endingType.name} endingUri=${describeUri(endingMediaUri)} coverUri=${describeUri(coverImageUri)}"
+            )
+            val sourceLayout = resolveVideoLayout(sourceVideoFile.absolutePath)
+            logStep(
+                trace,
+                "源视频布局解析完成",
+                "raw=${sourceLayout.rawWidth}x${sourceLayout.rawHeight} rotation=${sourceLayout.rotationDegrees} " +
+                    "display=${sourceLayout.displayWidth}x${sourceLayout.displayHeight}"
+            )
+            if (coverImageUri != null && introCoverMode == DedupIntroCoverMode.INSERT_FRAMES) {
+                normalizedIntroImageUri = normalizeImageToVideoLayout(
+                    context = context,
+                    sourceImageUri = coverImageUri,
+                    targetWidth = sourceLayout.displayWidth,
+                    targetHeight = sourceLayout.displayHeight,
+                    prefix = "vdown_intro_norm_",
+                    trace = trace
                 )
-                val compositionBuilder = Composition.Builder(
-                    EditedMediaItemSequence.Builder(sequenceItems)
-                        .setIsLooping(false)
+                normalizedIntroImageFile = normalizedIntroImageUri.path?.let(::File)
+            }
+            if (endingType == DedupEndingType.IMAGE && endingMediaUri != null) {
+                normalizedEndingImageUri = normalizeImageToVideoLayout(
+                    context = context,
+                    sourceImageUri = endingMediaUri,
+                    targetWidth = sourceLayout.displayWidth,
+                    targetHeight = sourceLayout.displayHeight,
+                    prefix = "vdown_ending_norm_",
+                    trace = trace
+                )
+                normalizedEndingImageFile = normalizedEndingImageUri.path?.let(::File)
+            }
+            val sourceMediaItem = MediaItem.fromUri(Uri.fromFile(sourceVideoFile))
+            val sequenceItems = mutableListOf<EditedMediaItem>()
+            val introDurationUs = ceil((introFrameCount * 1_000_000.0) / sourceFrameRate).toLong().coerceAtLeast(1L)
+            val frameRateInt = sourceFrameRate.roundToLong().toInt().coerceIn(1, 240)
+            var overlayFirstPtsUs = -1L
+            var overlayLastPtsUs = -1L
+            var overlayCallbackCount = 0L
+            var overlayVisibleCount = 0L
+
+            val sourceEditedItem = when {
+                coverImageUri != null && introCoverMode == DedupIntroCoverMode.OVERLAY_FRAMES -> {
+                    val coverBitmap = decodeCoverBitmap(
+                        context = context,
+                        imageUri = coverImageUri,
+                        targetWidth = sourceLayout.displayWidth,
+                        targetHeight = sourceLayout.displayHeight
+                    )
+                    val visibleSettings = OverlaySettings.Builder()
+                        .setAlphaScale(1f)
                         .build()
-                ).setTransmuxVideo(!requiresReencode)
-                    .setTransmuxAudio(!requiresReencode)
-                if (forceAudioTrack) {
-                    compositionBuilder.experimentalSetForceAudioTrack(true)
-                }
-                val composition = compositionBuilder.build()
-
-                val transformer = Transformer.Builder(context)
-                    .addListener(
-                        object : Transformer.Listener {
-                            override fun onCompleted(
-                                composition: Composition,
-                                exportResult: ExportResult
-                            ) {
-                                val overlayStats = if (usesOverlayIntro) {
-                                    " overlayCallbacks=$overlayCallbackCount overlayVisible=$overlayVisibleCount " +
-                                        "overlayFirstPtsUs=$overlayFirstPtsUs overlayLastPtsUs=$overlayLastPtsUs"
-                                } else {
-                                    ""
-                                }
-                                logStep(
-                                    trace,
-                                    "片头片尾合成完成",
-                                    "durationMs=${exportResult.durationMs} frameCount=${exportResult.videoFrameCount} " +
-                                        "avgAudioBitrate=${exportResult.averageAudioBitrate} avgVideoBitrate=${exportResult.averageVideoBitrate} " +
-                                        "output=${outputFile.absolutePath}$overlayStats"
-                                )
-                                if (continuation.isActive) {
-                                    continuation.resume(Unit)
-                                }
-                            }
-
-                            override fun onError(
-                                composition: Composition,
-                                exportResult: ExportResult,
-                                exportException: ExportException
-                            ) {
-                                logStepError(
-                                    trace,
-                                    "片头片尾合成失败 code=${exportException.getErrorCodeName()} reencode=$requiresReencode",
-                                    exportException
-                                )
-                                if (continuation.isActive) {
-                                    continuation.resumeWithException(
-                                        IllegalStateException(
-                                            "去重失败：片头/片尾合成失败（模式=${introCoverMode.title}, 片尾=${endingType.title}, " +
-                                                "重编码=${if (requiresReencode) "开启" else "关闭"}, 错误码=${exportException.getErrorCodeName()}, " +
-                                                "消息=${exportException.message ?: "未知错误"}）",
-                                            exportException
-                                        )
-                                    )
-                                }
-                            }
+                    val hiddenSettings = OverlaySettings.Builder()
+                        .setAlphaScale(0f)
+                        .build()
+                    val timedOverlay = object : BitmapOverlay() {
+                        override fun getBitmap(presentationTimeUs: Long): Bitmap {
+                            return coverBitmap
                         }
-                    )
-                    .build()
 
-                runCatching {
-                    transformer.start(composition, outputFile.absolutePath)
-                }.onFailure { error ->
-                    logStepError(
-                        trace,
-                        "片头片尾合成启动失败 introMode=${introCoverMode.name} endingType=${endingType.name}",
-                        error
-                    )
-                    if (continuation.isActive) {
-                        continuation.resumeWithException(
-                            IllegalStateException(
-                                "去重失败：片头/片尾合成启动失败（模式=${introCoverMode.title}, 片尾=${endingType.title}, " +
-                                    "重编码=${if (requiresReencode) "开启" else "关闭"}, 消息=${error.message ?: "未知错误"}）",
-                                error
-                            )
-                        )
+                        override fun getOverlaySettings(presentationTimeUs: Long): OverlaySettings {
+                            overlayCallbackCount += 1L
+                            if (overlayFirstPtsUs < 0L) {
+                                overlayFirstPtsUs = presentationTimeUs
+                            }
+                            overlayLastPtsUs = presentationTimeUs
+                            val relativePtsUs = (presentationTimeUs - overlayFirstPtsUs).coerceAtLeast(0L)
+                            val visible = relativePtsUs < introDurationUs
+                            if (visible) {
+                                overlayVisibleCount += 1L
+                            }
+                            return if (visible) visibleSettings else hiddenSettings
+                        }
                     }
+                    val overlayEffect = OverlayEffect(listOf(timedOverlay))
+                    val effects = Effects(emptyList(), listOf(overlayEffect))
+                    EditedMediaItem.Builder(sourceMediaItem)
+                        .setEffects(effects)
+                        .build()
                 }
 
-                continuation.invokeOnCancellation {
-                    logStep(trace, "片头片尾合成取消", "output=${outputFile.absolutePath}")
-                    runCatching { transformer.cancel() }
+                else -> EditedMediaItem.Builder(sourceMediaItem).build()
+            }
+
+            if (coverImageUri != null && introCoverMode == DedupIntroCoverMode.INSERT_FRAMES) {
+                val introItem = MediaItem.Builder()
+                    .setUri(normalizedIntroImageUri ?: coverImageUri)
+                    .setImageDurationMs(introDurationMs)
+                    .build()
+                sequenceItems += EditedMediaItem.Builder(introItem)
+                    .setFrameRate(frameRateInt)
+                    .build()
+            }
+
+            sequenceItems += sourceEditedItem
+
+            when {
+                endingType == DedupEndingType.IMAGE && endingMediaUri != null -> {
+                    val endingImageItem = MediaItem.Builder()
+                        .setUri(normalizedEndingImageUri ?: endingMediaUri)
+                        .setImageDurationMs(endingImageDurationMs.toLong())
+                        .build()
+                    sequenceItems += EditedMediaItem.Builder(endingImageItem)
+                        .setFrameRate(30)
+                        .build()
+                }
+
+                endingType == DedupEndingType.VIDEO && endingMediaUri != null -> {
+                    val endingVideoItem = MediaItem.fromUri(endingMediaUri)
+                    sequenceItems += EditedMediaItem.Builder(endingVideoItem).build()
                 }
             }
+
+            val usesImageIntro = coverImageUri != null && introCoverMode == DedupIntroCoverMode.INSERT_FRAMES
+            val usesOverlayIntro = coverImageUri != null && introCoverMode == DedupIntroCoverMode.OVERLAY_FRAMES
+            val usesImageEnding = endingType == DedupEndingType.IMAGE && endingMediaUri != null
+            val usesVideoEnding = endingType == DedupEndingType.VIDEO && endingMediaUri != null
+            val hasAnyCompositionEffect = usesImageIntro || usesOverlayIntro || usesImageEnding || usesVideoEnding
+
+            if (sequenceItems.size <= 1 && !hasAnyCompositionEffect) {
+                logStep(trace, "片头片尾合成跳过", "sequenceSize=${sequenceItems.size} hasAnyCompositionEffect=$hasAnyCompositionEffect")
+                return
+            }
+
+            withContext(Dispatchers.Main) {
+                suspendCancellableCoroutine { continuation ->
+                    val requiresReencode = usesImageIntro || usesOverlayIntro || usesImageEnding || usesVideoEnding
+                    val overlayWindowRule = if (usesOverlayIntro) {
+                        "relativePtsUs < introDurationUs（relativePtsUs=presentationTimeUs-firstPresentationTimeUs）"
+                    } else {
+                        "N/A"
+                    }
+                    // Media3 要求：当序列前段是无音轨素材（如图片），后段出现有音轨视频时，需要强制补音轨。
+                    val forceAudioTrack = usesImageIntro
+                    logStep(
+                        trace,
+                        "片头片尾合成开始",
+                        "sequence=${sequenceItems.size} overlayMode=$usesOverlayIntro introFrameCount=$introFrameCount " +
+                            "fps=${String.format(Locale.US, "%.2f", sourceFrameRate)} introDurationUs=$introDurationUs " +
+                            "overlayWindowRule=$overlayWindowRule reencode=$requiresReencode forceAudioTrack=$forceAudioTrack"
+                    )
+                    val compositionBuilder = Composition.Builder(
+                        EditedMediaItemSequence.Builder(sequenceItems)
+                            .setIsLooping(false)
+                            .build()
+                    ).setTransmuxVideo(!requiresReencode)
+                        .setTransmuxAudio(!requiresReencode)
+                    if (forceAudioTrack) {
+                        compositionBuilder.experimentalSetForceAudioTrack(true)
+                    }
+                    val composition = compositionBuilder.build()
+
+                    val transformer = Transformer.Builder(context)
+                        .addListener(
+                            object : Transformer.Listener {
+                                override fun onCompleted(
+                                    composition: Composition,
+                                    exportResult: ExportResult
+                                ) {
+                                    val overlayStats = if (usesOverlayIntro) {
+                                        " overlayCallbacks=$overlayCallbackCount overlayVisible=$overlayVisibleCount " +
+                                            "overlayFirstPtsUs=$overlayFirstPtsUs overlayLastPtsUs=$overlayLastPtsUs"
+                                    } else {
+                                        ""
+                                    }
+                                    logStep(
+                                        trace,
+                                        "片头片尾合成完成",
+                                        "durationMs=${exportResult.durationMs} frameCount=${exportResult.videoFrameCount} " +
+                                            "avgAudioBitrate=${exportResult.averageAudioBitrate} avgVideoBitrate=${exportResult.averageVideoBitrate} " +
+                                            "output=${outputFile.absolutePath}$overlayStats"
+                                    )
+                                    if (continuation.isActive) {
+                                        continuation.resume(Unit)
+                                    }
+                                }
+
+                                override fun onError(
+                                    composition: Composition,
+                                    exportResult: ExportResult,
+                                    exportException: ExportException
+                                ) {
+                                    logStepError(
+                                        trace,
+                                        "片头片尾合成失败 code=${exportException.getErrorCodeName()} reencode=$requiresReencode",
+                                        exportException
+                                    )
+                                    if (continuation.isActive) {
+                                        continuation.resumeWithException(
+                                            IllegalStateException(
+                                                "去重失败：片头/片尾合成失败（模式=${introCoverMode.title}, 片尾=${endingType.title}, " +
+                                                    "重编码=${if (requiresReencode) "开启" else "关闭"}, 错误码=${exportException.getErrorCodeName()}, " +
+                                                    "消息=${exportException.message ?: "未知错误"}）",
+                                                exportException
+                                            )
+                                        )
+                                    }
+                                }
+                            }
+                        )
+                        .build()
+
+                    runCatching {
+                        transformer.start(composition, outputFile.absolutePath)
+                    }.onFailure { error ->
+                        logStepError(
+                            trace,
+                            "片头片尾合成启动失败 introMode=${introCoverMode.name} endingType=${endingType.name}",
+                            error
+                        )
+                        if (continuation.isActive) {
+                            continuation.resumeWithException(
+                                IllegalStateException(
+                                    "去重失败：片头/片尾合成启动失败（模式=${introCoverMode.title}, 片尾=${endingType.title}, " +
+                                        "重编码=${if (requiresReencode) "开启" else "关闭"}, 消息=${error.message ?: "未知错误"}）",
+                                    error
+                                )
+                            )
+                        }
+                    }
+
+                    continuation.invokeOnCancellation {
+                        logStep(trace, "片头片尾合成取消", "output=${outputFile.absolutePath}")
+                        runCatching { transformer.cancel() }
+                    }
+                }
+            }
+        } finally {
+            runCatching { normalizedIntroImageFile?.delete() }
+            runCatching { normalizedEndingImageFile?.delete() }
         }
     }
 
