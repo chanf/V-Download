@@ -2,6 +2,10 @@
 
 一个面向 Android 的视频下载工具，支持从分享文本或手动输入中提取链接，解析视频源并下载到系统相册 `DCIM/v-down`。
 
+## 运行界面
+
+![V-Download 运行界面](screen/preview.jpg)
+
 ## 项目角色
 - 产品经理：`feng`（`chanf@me.com`）
 - 程序员：`Codex`（基于 GPT-5 的编码代理工具）
